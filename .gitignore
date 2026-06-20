@@ -1,0 +1,13 @@
+# Data stays local — never commit
+*.csv
+
+# Python noise
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor/OS junk
+.vscode/
+.idea/
+.DS_Store

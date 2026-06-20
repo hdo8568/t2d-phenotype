@@ -269,3 +269,112 @@ print("\nwrote t2d_cohort.csv  (", len(per), "patients,",
 cases = per[per["status"]=="CASE"]
 print("\nfirst 5 flagged cases (their facts):")
 print(cases[["t2dm_dx_count","t2dm_med_date","insulin_date","abnormal_lab"]].head())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# EDA + DATA-AVAILABILITY AUDIT
+# ============================================================
+
+# --- which_path: same logic as classify(), but records WHICH path
+# --- fired instead of just CASE/UNKNOWN. Order must match classify()
+# --- exactly — first match wins. This lets us see the path breakdown.
+def which_path(p):
+    no_t1d   = p["t1dm_dx_count"] == 0
+    has_t2d  = p["t2dm_dx_count"] > 0
+    on_med   = pd.notna(p["t2dm_med_date"])
+    on_insln = pd.notna(p["insulin_date"])
+    if no_t1d and has_t2d and on_med and on_insln and p["t2dm_med_date"] < p["insulin_date"]:
+        return "P1"
+    if no_t1d and has_t2d and not on_insln and on_med:
+        return "P2"
+    if no_t1d and has_t2d and not on_insln and not on_med and p["abnormal_lab"]:
+        return "P3"
+    if no_t1d and not has_t2d and on_med and p["abnormal_lab"]:
+        return "P4"
+    if no_t1d and has_t2d and on_insln and not on_med and p["physician_dx_count"] >= 2:
+        return "P5"
+    return "UNKNOWN"
+
+per["path"] = per.apply(which_path, axis=1)
+cases = per[per["path"] != "UNKNOWN"]
+
+# --- (1) cases per path: the headline EDA output ---
+print("\n===== EDA =====")
+print("cases:", len(cases), "| prevalence: {:.1%}".format(len(cases)/len(per)))
+print("cases per path:")
+print(cases["path"].value_counts().sort_index().to_string())
+
+# --- (2) age sanity: a diabetic child = a bug. BIRTHDATE is tz-naive,
+# --- so use a tz-naive reference date or the subtraction errors out. ---
+pts = patients.set_index("Id").copy()
+pts["BIRTHDATE"] = pd.to_datetime(pts["BIRTHDATE"])
+case_ages = (pd.Timestamp("2020-01-01") - pts.loc[cases.index, "BIRTHDATE"]).dt.days / 365.25
+print("\ncase age — min {:.0f} / median {:.0f} / max {:.0f} | under 18: {}".format(
+      case_ages.min(), case_ages.median(), case_ages.max(), int((case_ages < 18).sum())))
+
+# --- (3) code-level audit: count patients per INDIVIDUAL code.
+# --- A zero means the code is absent OR wrong (typo/wrong vocabulary).
+# --- A near-zero means the code is present but inert (doing no real work). ---
+def code_audit(label, codes, table):
+    print(f"\n{label}:")
+    for c in codes:
+        n = table[table["CODE"] == c]["PATIENT"].nunique()
+        flag = "   <-- ZERO" if n == 0 else ("   <-- near-zero" if n <= 2 else "")
+        print(f"  {c:<18} {n:>5} patients{flag}")
+
+code_audit("T2D_DX (conditions)",  T2D_DX,  conditions)
+code_audit("T1D_DX (conditions)",  T1D_DX,  conditions)   # expect 0 — intended exclusion
+code_audit("T2D_MED (medications)",T2D_MED, medications)
+code_audit("INSULIN (medications)",INSULIN, medications)
+code_audit("A1C (observations)",   A1C,     observations)
+code_audit("GLUCOSE (observations)",GLUCOSE,observations)
+
+
+
+
+
+
+
+missed = per[(per["t2dm_dx_count"] > 0) & (per["path"] == "UNKNOWN")]
+print("dropped dx-coded patients:", len(missed))
+print("  all on insulin:", missed["insulin_date"].notna().sum(), "of", len(missed))
+print("  with dx_count >= 2:", (missed["t2dm_dx_count"] >= 2).sum())
+
+
+
+
+
+
+
+
+

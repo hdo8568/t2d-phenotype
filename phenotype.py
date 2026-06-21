@@ -1,37 +1,24 @@
 import pandas as pd
 
-
-# Stage 1: load the four CSVs and confirm each one reads.
-# pd.read_csv opens a CSV and returns it as a DataFrame — a table
-# you can filter and count. The string is the filename; because the
-# script lives in the same folder as the data, no full path is needed.
-
 patients     = pd.read_csv("patients.csv")
 conditions   = pd.read_csv("conditions.csv")
 medications  = pd.read_csv("medications.csv")
 observations = pd.read_csv("observations.csv")
-
-
 conditions["CODE"]   = conditions["CODE"].astype(str)
 medications["CODE"]  = medications["CODE"].astype(str)
 observations["CODE"] = observations["CODE"].astype(str)
-
 # .shape gives (rows, columns). Printing it proves each table loaded
-# and lets you eyeball the row counts against what we found earlier.
 print("patients:    ", patients.shape)
 print("conditions:  ", conditions.shape)
 print("medications: ", medications.shape)
 print("observations:", observations.shape)
-#QUESTION: are patients, conditions, medications, and observations
-#the primary tables we will be working with? It seems to be this way right now
-
-
 
 #Step 2 "sets up" step 3
 # Stage 2: code lists. Each bucket from our reference table becomes
 # one list. These are the filters every algorithm step will use.
 
 # --- Diagnosis codes (SNOMED), used to count diagnosis dates ---
+#conditions.csv
 T2D_DX = [
     "44054006",         # Diabetes (generic; kept as T2D per our decision)
     "368581000119106",  # Neuropathy due to type 2 DM
@@ -43,27 +30,31 @@ T2D_DX = [
     "60951000119105",   # Blindness due to type 2 DM
     "157141000119108",  # Proteinuria due to type 2 DM
 ]
-
+#conditions.csv
 T1D_DX = [
     "46635009",         # Type 1 DM (absent in Coherent; count will be 0)
 ]
-
+#medications.csv
 # --- Medication codes (RxNorm) ---
 T2D_MED = [
     "860975",   # Metformin ER 500mg
     "897122",   # liraglutide (GLP-1)
     "1373463",  # canagliflozin (SGLT2)
 ]
-
+#medications.csv
 INSULIN = [          # the "T1D medication" bucket: insulin (+ Symlin, absent)
     "106892",   # Humulin
     "865098",   # Insulin Lispro [Humalog]
 ]
 
+#observations.csv
 # --- Lab codes (LOINC) and their abnormal thresholds ---
 A1C = ["4548-4"]              # Hemoglobin A1c, %     -> abnormal if >= 6.5
 GLUCOSE = ["2339-0", "2345-7"]  # blood glucose, mg/dL -> abnormal if > 200
-
+#These codes do not indicate test status -- just indicates whether patient has done test
+#Later, we will make a new table filtering for these codes, then a new table after that filtering
+#which values associated with the patietn ode is indeed over the threshold
+#CODE is the field we test, then the VALUE field tells the actual number the patient got
 A1C_THRESHOLD = 6.5
 GLUCOSE_THRESHOLD = 200
 
@@ -73,6 +64,12 @@ print("T1D_DX codes:  ", len(T1D_DX))
 print("T2D_MED codes: ", len(T2D_MED))
 print("INSULIN codes: ", len(INSULIN))
 print("A1C / GLUCOSE: ", len(A1C), "/", len(GLUCOSE))
+
+
+
+
+
+
 
 
 
@@ -369,7 +366,15 @@ missed = per[(per["t2dm_dx_count"] > 0) & (per["path"] == "UNKNOWN")]
 print("dropped dx-coded patients:", len(missed))
 print("  all on insulin:", missed["insulin_date"].notna().sum(), "of", len(missed))
 print("  with dx_count >= 2:", (missed["t2dm_dx_count"] >= 2).sum())
-
+##We are doing this because we want to see whether the rule-based cohort is
+##trustworthy enough to be the baseline the LLM gets compared against
+#This motivates the questinos:
+#are those 68 corrrectly exluded for a proper clinical reason, or
+#did the algorithm have a bug
+#Based on our assessment, we see that most were dropped due to insulin.
+#Furthermore, Coherent had zero type-1 pateints, so the exlusion guard
+#seems to be something that doesn't apply in our dataset.
+#I would suspect that an LLM would diagnose these 67 individuals T2D.
 
 
 

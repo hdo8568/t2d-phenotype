@@ -8,11 +8,14 @@ conditions["CODE"]   = conditions["CODE"].astype(str)
 medications["CODE"]  = medications["CODE"].astype(str)
 observations["CODE"] = observations["CODE"].astype(str)
 # .shape gives (rows, columns). Printing it proves each table loaded
+print("\n")
+print("\n")
 print("patients:    ", patients.shape)
 print("conditions:  ", conditions.shape)
 print("medications: ", medications.shape)
 print("observations:", observations.shape)
-
+print("\n")
+print("\n")
 #Step 2 "sets up" step 3
 # Stage 2: code lists. Each bucket from our reference table becomes
 # one list. These are the filters every algorithm step will use.
@@ -189,7 +192,8 @@ print("  T2D dx > 0:", (per["t2dm_dx_count"] > 0).sum())
 print("  on T2D med:", per["t2dm_med_date"].notna().sum())
 print("  on insulin:", per["insulin_date"].notna().sum())
 print("  abnormal lab:", per["abnormal_lab"].sum())
-
+print("\n")
+print("\n")
 
 
 
@@ -245,7 +249,8 @@ n_cases = (per["status"] == "CASE").sum()
 print("T2D cases:", n_cases)
 print("prevalence: {:.1%}".format(n_cases / len(per)))
 
-
+print("\n")
+print("\n")
 
 
 
@@ -296,7 +301,8 @@ print(cases[["t2dm_dx_count","t2dm_med_date","insulin_date","abnormal_lab"]].hea
 
 
 
-
+print("\n")
+print("\n")
 
 # ============================================================
 # EDA + DATA-AVAILABILITY AUDIT
@@ -330,7 +336,8 @@ print("\n===== EDA =====")
 print("cases:", len(cases), "| prevalence: {:.1%}".format(len(cases)/len(per)))
 print("cases per path:")
 print(cases["path"].value_counts().sort_index().to_string())
-
+print("\n")
+print("\n")
 # --- (2) age sanity: a diabetic child = a bug. BIRTHDATE is tz-naive,
 # --- so use a tz-naive reference date or the subtraction errors out. ---
 pts = patients.set_index("Id").copy()
@@ -338,7 +345,8 @@ pts["BIRTHDATE"] = pd.to_datetime(pts["BIRTHDATE"])
 case_ages = (pd.Timestamp("2020-01-01") - pts.loc[cases.index, "BIRTHDATE"]).dt.days / 365.25
 print("\ncase age — min {:.0f} / median {:.0f} / max {:.0f} | under 18: {}".format(
       case_ages.min(), case_ages.median(), case_ages.max(), int((case_ages < 18).sum())))
-
+print("\n")
+print("\n")
 # --- (3) code-level audit: count patients per INDIVIDUAL code.
 # --- A zero means the code is absent OR wrong (typo/wrong vocabulary).
 # --- A near-zero means the code is present but inert (doing no real work). ---
@@ -394,22 +402,27 @@ print("  with dx_count >= 2:", (missed["t2dm_dx_count"] >= 2).sum())
 
 # ---- CONTROL ALGORITHM: data-availability probe ----
 # Q1: does Coherent encode family history of diabetes? Search condition descriptions.
+print("\n")
+print("\n")
 fh = conditions[conditions["DESCRIPTION"].str.contains("family history", case=False, na=False)]
 print("family-history condition rows:", len(fh))
 print(fh["DESCRIPTION"].value_counts().head(10).to_string() if len(fh) else "  (none)")
-
+print("\n")
+print("\n")
 # Q2: prediabetes / impaired-glucose / gestational — the broad Table 9 categories.
 # These must EXCLUDE people from controls. How prevalent are they?
 for term in ["prediabet", "impaired", "gestational", "glycosuria", "screening for diabet"]:
     n = conditions[conditions["DESCRIPTION"].str.contains(term, case=False, na=False)]["PATIENT"].nunique()
     print(f"  '{term}': {n} patients")
-
+print("\n")
+print("\n")
 # Q3: encounters — does encounters.csv have an office/outpatient type we can count?
 enc = pd.read_csv("encounters.csv")
 print("\nencounter columns:", list(enc.columns))
 if "ENCOUNTERCLASS" in enc.columns:
     print(enc["ENCOUNTERCLASS"].value_counts().to_string())
-
+print("\n")
+print("\n")
 
 
 
@@ -526,6 +539,7 @@ print("\n===== CONTROL ALGORITHM =====")
 print("cases:    ", n_case)
 print("controls: ", n_ctrl)
 print("middle:   ", n_mid, "({:.1%})".format(n_mid/len(per)))
+print("total patients (cases + controls + middle) = ", len(per))
 print("\ncontrol condition attrition (whole population):")
 print("  dm_broad_count == 0:", (per["dm_broad_count"] == 0).sum())
 print("  glucose drawn:      ", per["glucose_drawn"].sum())

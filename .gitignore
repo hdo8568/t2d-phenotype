@@ -11,3 +11,10 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+.env
+
+*.db
+*.parquet
+*.jsonl
+outputs/
+.env*

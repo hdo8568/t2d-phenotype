@@ -550,3 +550,21 @@ print("  no DM med:          ", (~per["on_dm_med"]).sum())
 # sanity: no patient should be both case and control
 both = per[(per["path"] != "UNKNOWN") & per["control"]]
 print("\npatients flagged BOTH case and control (must be 0):", len(both))
+
+
+
+
+
+
+
+
+
+
+
+
+per.to_csv("t2d_cohort.csv")
+
+
+
+
+

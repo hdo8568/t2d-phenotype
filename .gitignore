@@ -18,3 +18,4 @@ venv/
 *.jsonl
 outputs/
 .env*
+a.py

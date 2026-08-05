@@ -363,6 +363,44 @@ def render_chart(record, mask=False, max_labs_per_code=4, include_notes=False):
     return "\n".join(L)
 
 
+def render_chart_minimal(record, dx_codes, a1c_codes, glucose_codes, med_codes):
+    """The ablation chart: six facts, nothing else.
+
+    Age, sex, whether a T2D diagnosis code exists, the maximum A1c and glucose
+    ever recorded, and whether a diabetes medication exists. That is the entire
+    input. It is deliberately close to what the PheKB rules themselves key on —
+    the question this renders is whether the model needs a chart at all, or
+    whether six numbers get the same answer for a fraction of the tokens.
+
+    Parameterized by code list rather than importing from labelers.rules, so
+    records.py stays method-agnostic and the next phenotype can pass its own.
+    """
+    d = record["demographics"]
+    has_dx = any(c["CODE"] in dx_codes for c in record["conditions"])
+    has_med = any(m["CODE"] in med_codes for m in record["medications"])
+
+    def peak(codes):
+        vals = []
+        for lab in record["labs"]:
+            if lab["CODE"] in codes:
+                try:
+                    vals.append(float(lab["VALUE"]))
+                except (TypeError, ValueError):
+                    continue
+        return max(vals) if vals else None
+
+    a1c, glu = peak(a1c_codes), peak(glucose_codes)
+    return "\n".join([
+        f"Age: {d['age_at_reference']}",
+        f"Sex: {d['gender']}",
+        f"Type 2 diabetes diagnosis code on file: {'yes' if has_dx else 'no'}",
+        f"Highest HbA1c ever recorded: {f'{a1c}%' if a1c is not None else 'never measured'}",
+        f"Highest glucose ever recorded: "
+        f"{f'{glu} mg/dL' if glu is not None else 'never measured'}",
+        f"Diabetes medication on file: {'yes' if has_med else 'no'}",
+    ])
+
+
 def chart_size(chart):
     """Characters and a rough token estimate (~4 chars/token) for one chart.
 

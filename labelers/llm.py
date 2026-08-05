@@ -39,6 +39,22 @@ except ImportError:
 
 MODEL = "claude-sonnet-5"
 
+# Dollars per million tokens, (input, output). Sonnet is on introductory rates
+# through 2026-08-31; standard is $3/$15. Kept here rather than in run.py
+# because a cascade bills two models in one run and the cost of a row depends
+# on which model produced it — the pricing has to travel with the model name.
+MODEL_PRICING = {
+    "claude-sonnet-5": (2.00, 10.00),
+    "claude-haiku-4-5-20251001": (1.00, 5.00),
+}
+
+
+def price_of(model):
+    if model not in MODEL_PRICING:
+        raise KeyError(f"no pricing for {model!r} — add it to MODEL_PRICING "
+                       f"before running, or the cost report is a guess")
+    return MODEL_PRICING[model]
+
 # Retry policy for 429 / 503 / 5xx / connection drops. We turn the SDK's own
 # retries OFF and own the loop here, so "we retried five times and then fell
 # back" is something we can log rather than something that happened invisibly.
@@ -114,6 +130,7 @@ class Verdict:
     api_calls: int = 0
     attempts: int = 0
     latency_s: float = 0.0
+    model: str = MODEL
     fell_back: bool = False
     truncated: bool = False
     refused: bool = False
@@ -182,6 +199,21 @@ _parse_log_lock = threading.Lock()
 # a row. Reported by the runner so a degraded run is never mistaken for clean.
 FEATURES = {"effort": True, "structured_output": True, "caching": True}
 _features_lock = threading.Lock()
+
+# Bumped every time a feature is disabled. Without it, feature degradation is
+# only safe for the ONE worker that happens to trip the 400 first: it flips the
+# flag, retries, and succeeds, while every other in-flight worker gets the same
+# 400, finds the flag already off, classifies a BadRequestError as
+# non-retryable, and falls back. At 16 workers that silently converts a whole
+# wave of patients into fallbacks and — in a cascade — escalates every one of
+# them to the expensive model. Comparing this counter across an attempt tells a
+# worker "someone else already fixed this, try again" instead.
+_features_version = 0
+
+
+def features_version():
+    with _features_lock:
+        return _features_version
 
 
 def resolved_model():
@@ -256,6 +288,7 @@ def _degrade_on_bad_request(exc):
     import anthropic
     if not isinstance(exc, anthropic.BadRequestError):
         return False
+    global _features_version
     msg = str(exc).lower()
     with _features_lock:
         for key, needles in (("effort", ("effort",)),
@@ -263,6 +296,7 @@ def _degrade_on_bad_request(exc):
                              ("caching", ("cache_control", "cache"))):
             if FEATURES[key] and any(n in msg for n in needles):
                 FEATURES[key] = False
+                _features_version += 1
                 print(f"[llm] API rejected '{key}' — disabling it for the rest "
                       f"of this run and retrying. ({exc})")
                 return True
@@ -282,7 +316,7 @@ def _retry_after(exc, attempt):
                MAX_DELAY_SECONDS)
 
 
-def _build_request(chart, effort):
+def _build_request(chart, effort, model=MODEL):
     with _features_lock:
         use_effort = FEATURES["effort"]
         use_structured = FEATURES["structured_output"]
@@ -293,7 +327,7 @@ def _build_request(chart, effort):
         system_block["cache_control"] = {"type": "ephemeral"}
 
     kwargs = {
-        "model": MODEL,
+        "model": model,
         "max_tokens": MAX_TOKENS,
         "system": [system_block],
         "messages": [{"role": "user", "content": USER_TEMPLATE.format(chart=chart)}],
@@ -355,7 +389,7 @@ def _parse_verdict(text):
 
 
 def adjudicate(record, rule_label=0, chart=None, render=None, effort=DEFAULT_EFFORT,
-               governor=None):
+               governor=None, model=MODEL):
     """One patient, one call (plus retries). Returns a Verdict.
 
     `rule_label` is the fallback answer, used only if every attempt fails. It is
@@ -366,18 +400,19 @@ def adjudicate(record, rule_label=0, chart=None, render=None, effort=DEFAULT_EFF
             from records import render_chart as render
         chart = render(record)
 
-    verdict = Verdict(label=rule_label, reason="")
+    verdict = Verdict(label=rule_label, reason="", model=model)
     last_exc = None
     started = time.time()
 
     for attempt in range(MAX_ATTEMPTS):
         try:
             verdict.attempts += 1
+            features_at_send = features_version()
             client = _get_client()
             if governor is not None:
                 governor.acquire()
             try:
-                response = client.messages.create(**_build_request(chart, effort))
+                response = client.messages.create(**_build_request(chart, effort, model))
             finally:
                 if governor is not None:
                     governor.release()
@@ -435,6 +470,11 @@ def adjudicate(record, rule_label=0, chart=None, render=None, effort=DEFAULT_EFF
             try:
                 if _degrade_on_bad_request(exc):
                     continue          # same attempt budget, one fewer feature
+                # Another worker disabled the offending feature while this
+                # request was in flight. The request we sent is stale, not
+                # invalid — rebuild and retry rather than falling back.
+                if features_version() != features_at_send:
+                    continue
                 if is_fatal(exc):
                     break             # credentials/model: retrying cannot help
                 retryable = _is_retryable(exc)
@@ -460,17 +500,17 @@ def adjudicate(record, rule_label=0, chart=None, render=None, effort=DEFAULT_EFF
 
 
 def preflight_call(chart="PATIENT test\n  age 60 | M\n\nCONDITIONS:\n  (none)",
-                   effort=DEFAULT_EFFORT):
+                   effort=DEFAULT_EFFORT, model=MODEL):
     """Exactly ONE API call, no retry loop. Returns (ok, info-dict).
 
     This exists so a bad key or a bad model string costs one request and a
     clear message, instead of 3539 requests and a confusing pile of fallbacks.
     """
-    info = {"model_requested": MODEL}
+    info = {"model_requested": model}
     started = time.time()
     try:
         client = _get_client()
-        response = client.messages.create(**_build_request(chart, effort))
+        response = client.messages.create(**_build_request(chart, effort, model))
     except Exception as exc:  # noqa: BLE001
         info["error"] = f"{type(exc).__name__}: {exc}"
         info["fatal"] = is_fatal(exc)

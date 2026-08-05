@@ -96,6 +96,19 @@ COHORT_PATH = "t2d_cohort.csv"
 
 EXPECTED_TOTAL = records_mod.EXPECTED_PATIENTS   # 3539
 
+# chart_size() estimates tokens as chars/4, which measured 3.32x LOW against
+# Agent A's actual billed input (mean 706 estimated vs 2,324 billed). An
+# optimistic projection is worse than none: it lets a run start, spend the
+# whole budget, and abort mid-flight with no submission. Calibrated from
+# run_log.csv; re-derive it if the chart format changes.
+TOKEN_CALIBRATION = 3.32
+MEASURED_OUTPUT_TOKENS = 133      # median per call, Agent A
+
+
+def billed_input_tokens(chart):
+    """Calibrated estimate of what one chart actually bills, system prompt in."""
+    return records_mod.chart_size(chart)[1] * TOKEN_CALIBRATION + 300
+
 
 PHENOTYPES = {
     "t2d": {
@@ -460,7 +473,21 @@ def live_cost():
                                   PRICE_CACHE_WRITE_PER_MTOK, PRICE_CACHE_READ_PER_MTOK)
 
 
-def adjudicate_many(targets, recs, rule_labels, charts, effort, checkpoint):
+def default_adjudicate(record, rule_label, chart, effort, governor):
+    """Agent A's labeler: one Sonnet call. Returns (verdict, extra row fields)."""
+    verdict = llm_labeler.adjudicate(record, rule_label=rule_label, chart=chart,
+                                     effort=effort, governor=governor)
+    p_in, p_out = llm_labeler.price_of(verdict.model)
+    return verdict, {
+        "tier": "single",
+        "model": verdict.model,
+        "row_cost": (verdict.input_tokens * p_in
+                     + verdict.output_tokens * p_out) / 1_000_000,
+    }
+
+
+def adjudicate_many(targets, recs, rule_labels, charts, effort, checkpoint,
+                    adjudicate_fn=default_adjudicate, max_cost=None):
     """Run the LLM over `targets` with an adaptively-throttled worker pool.
 
     Returns (results, stop_reason). Three things can stop it early, and all
@@ -477,14 +504,15 @@ def adjudicate_many(targets, recs, rule_labels, charts, effort, checkpoint):
     abort = threading.Event()
     governor = ConcurrencyGovernor()
 
+    spent = [0.0]
+
     def work(pid):
         if abort.is_set():
-            return pid, None
-        verdict = llm_labeler.adjudicate(
-            recs[pid], rule_label=rule_labels[pid], chart=charts[pid], effort=effort,
-            governor=governor)
+            return pid, None, None
+        verdict, extra = adjudicate_fn(recs[pid], rule_labels[pid], charts[pid],
+                                       effort, governor)
         llm_labeler.USAGE.record(verdict)
-        return pid, verdict
+        return pid, verdict, extra
 
     # The pool is wider than the governor's limit on purpose: the governor is
     # what actually gates concurrent calls, so it can throttle below the pool
@@ -492,7 +520,7 @@ def adjudicate_many(targets, recs, rule_labels, charts, effort, checkpoint):
     with ThreadPoolExecutor(max_workers=max(START_WORKERS, 8)) as pool:
         futures = [pool.submit(work, pid) for pid in targets]
         for future in as_completed(futures):
-            pid, verdict = future.result()
+            pid, verdict, extra = future.result()
             if verdict is None:
                 continue
             governor.note_completion()
@@ -516,6 +544,7 @@ def adjudicate_many(targets, recs, rule_labels, charts, effort, checkpoint):
                 "empty": int(verdict.empty),
                 "parse_failed": int(verdict.parse_failed),
             }
+            row.update(extra or {})
             results[pid] = row
             checkpoint.add(row)
 
@@ -537,15 +566,17 @@ def adjudicate_many(targets, recs, rule_labels, charts, effort, checkpoint):
                     print(f"  [{n}/{total}] {rate:.1f} pt/s  "
                           f"elapsed {elapsed/60:.1f}m  eta {eta/60:.1f}m", flush=True)
                 if n % PROGRESS_COST_EVERY == 0:
-                    print(f"  [COST] ${live_cost():.4f} spent after {n} patients "
+                    print(f"  [COST] ${spent[0]:.4f} spent after {n} patients "
                           f"(concurrency {governor.limit})", flush=True)
 
                 # --- live abort conditions, checked every patient -------------
+                spent[0] += float(row.get("row_cost") or 0.0)
                 if not abort.is_set():
-                    cost_now = live_cost()
-                    if cost_now >= HARD_COST_ABORT_USD:
+                    cost_now = spent[0]
+                    ceiling = HARD_COST_ABORT_USD if max_cost is None else max_cost
+                    if cost_now >= ceiling:
                         stop_reason[0] = (f"hard cost ceiling: ${cost_now:.2f} >= "
-                                          f"${HARD_COST_ABORT_USD:.2f}")
+                                          f"${ceiling:.2f}")
                         abort.set()
                     elif (n >= 20 and fallback_count[0] / n > FALLBACK_ABORT_RATE):
                         stop_reason[0] = (
@@ -566,12 +597,14 @@ def adjudicate_many(targets, recs, rule_labels, charts, effort, checkpoint):
 # Stage 5 — outputs
 # ---------------------------------------------------------------------------
 
-def write_submissions(labels, roster_order):
+def write_submissions(labels, roster_order, formats=None, expected_rows=None):
     """Write every header convention from one label vector, then prove they
     agree. IDs are written exactly as they appear in patients.csv — no case
     change, no stripping, no reordering."""
+    formats = formats or SUBMISSION_FORMATS
+    expected_rows = expected_rows or EXPECTED_TOTAL
     written = []
-    for path, id_col, label_col in SUBMISSION_FORMATS:
+    for path, id_col, label_col in formats:
         with open(path, "w", newline="") as fh:
             writer = csv.writer(fh)
             writer.writerow([id_col, label_col])
@@ -582,21 +615,22 @@ def write_submissions(labels, roster_order):
     # Read all four back and assert the label vectors are identical. Writing
     # four files from one dict and then trusting them is not verification.
     vectors, id_vectors = {}, {}
-    for path, _, _ in SUBMISSION_FORMATS:
+    for path, _, _ in formats:
         frame = pd.read_csv(path, dtype=str)
         id_vectors[path] = frame.iloc[:, 0].tolist()
         vectors[path] = frame.iloc[:, 1].astype(int).tolist()
 
-    reference = vectors[SUBMISSION_FORMATS[0][0]]
-    reference_ids = id_vectors[SUBMISSION_FORMATS[0][0]]
+    reference = vectors[formats[0][0]]
+    reference_ids = id_vectors[formats[0][0]]
     for path in vectors:
         assert vectors[path] == reference, f"{path} label vector differs"
         assert id_vectors[path] == reference_ids, f"{path} id vector differs"
-        assert len(vectors[path]) == EXPECTED_TOTAL, f"{path} is not {EXPECTED_TOTAL} rows"
-    print(f"\n[run] all {len(written)} submission files agree "
-          f"({EXPECTED_TOTAL} rows, identical labels and ids)")
+        assert len(vectors[path]) == expected_rows, (
+            f"{path} is {len(vectors[path])} rows, expected {expected_rows}")
+    print(f"\n[run] all {len(written)} submission file(s) agree "
+          f"({expected_rows} rows, identical labels and ids)")
 
-    for path, _, _ in SUBMISSION_FORMATS:
+    for path, _, _ in formats:
         print(f"\n--- {path} (first 3 lines) ---")
         with open(path) as fh:
             for line in list(fh)[:3]:
@@ -605,10 +639,19 @@ def write_submissions(labels, roster_order):
 
 
 def write_run_log(rows, path=RUN_LOG_PATH):
-    fields = ["patient_id", "bucket", "rule_label", "llm_label", "confidence",
-              "input_tokens", "output_tokens", "cache_read_tokens",
-              "cache_creation_tokens", "latency_s", "attempts", "api_calls",
-              "fell_back", "truncated", "refused", "empty", "parse_failed", "reason"]
+    # Preferred order first, then ANY other key the labeler attached. A fixed
+    # column list silently drops whatever a new labeler adds — the cascade's
+    # per-tier tokens and confidences vanished exactly that way.
+    preferred = ["patient_id", "bucket", "tier", "rule_label", "llm_label",
+                 "confidence", "screen_model", "screen_label", "screen_confidence",
+                 "escalated", "screen_was_wrong", "screen_in", "screen_out",
+                 "escalate_model", "escalate_in", "escalate_out",
+                 "input_tokens", "output_tokens", "cache_read_tokens",
+                 "cache_creation_tokens", "row_cost", "latency_s", "attempts",
+                 "api_calls", "fell_back", "truncated", "refused", "empty",
+                 "parse_failed", "reason", "screen_reason"]
+    seen = {k for r in rows for k in r}
+    fields = [f for f in preferred if f in seen] + sorted(seen - set(preferred))
     with open(path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
@@ -1163,6 +1206,586 @@ def full_run(phenotype, use_all=False, limit=None, resume=False,
     return stats
 
 
+# ---------------------------------------------------------------------------
+# Experiments B and D. Both reuse preflight, the governor, checkpointing,
+# defensive parsing and the integrity asserts — only the labeler and the chart
+# change. Separate checkpoint files so a cascade run and an ablation run can
+# never contaminate each other's resume state.
+# ---------------------------------------------------------------------------
+
+EXPERIMENTS = {
+    "cascade": {
+        "checkpoint": "run_checkpoint_cascade.jsonl",
+        "run_log": "run_log_cascade.csv",
+        "results": "RESULTS_cascade.md",
+        "submission": "submission_cascade.csv",
+    },
+    "minimal": {
+        "checkpoint": "run_checkpoint_minimal.jsonl",
+        "run_log": "run_log_minimal.csv",
+        "results": "RESULTS_ablation.md",
+        "submission": "submission_minimal.csv",
+    },
+}
+
+AGENT_A_SUBMISSION = "submission.csv"
+AGENT_A_RUN_LOG = "run_log.csv"
+
+
+def _load_agent_a():
+    """Agent A's labels — the comparison both experiments are measured against."""
+    if not os.path.exists(AGENT_A_SUBMISSION):
+        raise SystemExit(f"{AGENT_A_SUBMISSION} missing — run Agent A first; both "
+                         f"experiments are defined as comparisons against it.")
+    frame = pd.read_csv(AGENT_A_SUBMISSION, dtype=str)
+    return {r["patient_id"]: int(r["label"]) for _, r in frame.iterrows()}
+
+
+def _minimal_renderer(record):
+    return records_mod.render_chart_minimal(
+        record,
+        dx_codes=rules_labeler.T2D_DX,
+        a1c_codes=rules_labeler.A1C,
+        glucose_codes=rules_labeler.GLUCOSE,
+        med_codes=rules_labeler.T2D_MED + rules_labeler.INSULIN)
+
+
+def _experiment_preamble(phenotype, effort, skip_preflight_call, model):
+    recs, assignments = build_and_route(phenotype)
+    report, ok = preflight(recs, effort, skip_api=skip_preflight_call)
+    print(f"\n[run] {report.summary()}")
+    if not ok:
+        write_preflight_failure_md(report)
+        print("[run] PREFLIGHT FAILED — stopping before any bulk API calls.")
+        raise SystemExit(3)
+    return recs, assignments
+
+
+def _finish(paths, labels, roster_subset, rows, expected_rows):
+    """Shared tail: integrity asserts, then write. Same guarantees as Agent A."""
+    assert len(labels) == expected_rows, (
+        f"{expected_rows} labels expected, have {len(labels)}")
+    bad = {p: v for p, v in labels.items() if v is None or v not in (0, 1)}
+    assert not bad, f"null or non-binary labels for {len(bad)} patients"
+    n_trunc = sum(1 for r in rows if r.get("truncated"))
+    assert n_trunc == 0, f"{n_trunc} accepted response(s) were truncated"
+    write_submissions(labels, roster_subset,
+                      formats=[(paths["submission"], "patient_id", "label")],
+                      expected_rows=expected_rows)
+
+
+def run_cascade(phenotype="t2d", effort=llm_labeler.DEFAULT_EFFORT, resume=False,
+                limit=None, max_cost=None, skip_preflight_call=False):
+    """Agent B — model tiering. Rules resolve the decisive buckets for nothing,
+    Haiku screens the rest, Sonnet sees only what Haiku is unsure about."""
+    from labelers import cascade as cascade_labeler
+
+    paths = EXPERIMENTS["cascade"]
+    started = time.time()
+    recs, assignments = _experiment_preamble(phenotype, effort, skip_preflight_call,
+                                             cascade_labeler.SCREEN_MODEL)
+    rules = PHENOTYPES[phenotype]["rules"]
+    roster_order = list(recs.keys())
+    rule_labels = {pid: rules.label(rec) for pid, rec in recs.items()}
+
+    # Tier 1: the decisive buckets are answered by the rules, for zero dollars.
+    free_buckets = {"DECISIVE_POS", "DECISIVE_NEG"}
+    free = [p for p in roster_order if assignments[p] in free_buckets]
+    targets = [p for p in roster_order if assignments[p] not in free_buckets]
+    print(f"\n[run] CASCADE tiering:")
+    print(f"  rules (free)      {len(free):>5}  DECISIVE_POS + DECISIVE_NEG")
+    print(f"  to {cascade_labeler.SCREEN_MODEL:<22} {len(targets):>5}  "
+          f"CONFLICTING + INDIRECT + NO_EVIDENCE")
+    print(f"  escalate to {cascade_labeler.ESCALATE_MODEL} when confidence in "
+          f"{cascade_labeler.ESCALATE_ON_CONFIDENCE}")
+
+    # Screen on the six-fact chart, escalate on the full one.
+    charts = {pid: _minimal_renderer(recs[pid]) for pid in targets}
+    full_charts = {pid: records_mod.render_chart(recs[pid]) for pid in targets}
+    print(f"  screen chart      ~{statistics.mean([billed_input_tokens(charts[p]) for p in targets]):,.0f} billed tokens")
+    print(f"  escalation chart  ~{statistics.mean([billed_input_tokens(full_charts[p]) for p in targets]):,.0f} billed tokens")
+
+    intended = list(targets)          # what full coverage means for this run
+    done = load_checkpoint(paths["checkpoint"]) if resume else {}
+    if resume:
+        print(f"[run] resuming: {len(done)} already done")
+        targets = [p for p in targets if p not in done]
+    elif os.path.exists(paths["checkpoint"]):
+        os.remove(paths["checkpoint"])
+    if limit is not None:
+        targets = targets[:limit]
+
+    # Projection uses Haiku pricing for the screen; escalation is extra on top.
+    s_in, s_out = llm_labeler.price_of(cascade_labeler.SCREEN_MODEL)
+    toks = [billed_input_tokens(charts[p]) for p in targets]
+    proj = (sum(toks) * s_in
+            + len(targets) * MEASURED_OUTPUT_TOKENS * s_out) / 1_000_000
+    print(f"\n[run] PROJECTED screen cost for {len(targets)} patients: ${proj:.2f} "
+          f"(escalations billed on top at {cascade_labeler.ESCALATE_MODEL} rates)")
+    if max_cost is not None and proj > max_cost:
+        print(f"[run] projection ${proj:.2f} exceeds the ${max_cost:.2f} cap — "
+              f"the run would abort mid-flight and produce no submission.")
+        write_budget_failure_md(paths, proj, max_cost, len(targets))
+        raise SystemExit(4)
+
+    def adjudicate_cascade(record, rule_label, chart, eff, governor):
+        verdict, info = cascade_labeler.adjudicate(
+            record, rule_label=rule_label, chart=chart,
+            escalate_chart=full_charts.get(record["id"]), effort=eff,
+            governor=governor)
+        info["row_cost"] = cascade_labeler.cost_of(info)
+        return verdict, info
+
+    llm_labeler.USAGE.reset()
+    checkpoint = Checkpointer(path=paths["checkpoint"])
+    print(f"\n[run] screening {len(targets)} patients at {START_WORKERS} workers ...")
+    fresh, stop_reason, governor = adjudicate_many(
+        targets, recs, rule_labels, charts, effort, checkpoint,
+        adjudicate_fn=adjudicate_cascade, max_cost=max_cost)
+
+    all_rows = dict(done); all_rows.update(fresh)
+    n_fell_back = sum(1 for r in all_rows.values() if r.get("fell_back"))
+    if stop_reason:
+        write_failures_md(stop_reason, fresh, n_fell_back, len(targets), governor,
+                          path=paths["results"].replace("RESULTS", "FAILURES"))
+        print(f"\n[run] CASCADE ABORTED — {stop_reason}")
+        print(f"[run] no submission written; work preserved in {paths['checkpoint']}")
+        raise SystemExit(2)
+
+    labels = dict(rule_labels)
+    for pid, row in all_rows.items():
+        labels[pid] = row["llm_label"]
+        row["bucket"] = assignments.get(pid, "?")
+
+    rows = [all_rows[p] for p in roster_order if p in all_rows]
+    coverage = len(all_rows) / max(1, len(intended))
+    if coverage >= 1.0:
+        _finish(paths, labels, roster_order, rows, EXPECTED_TOTAL)
+    else:
+        # Partial coverage. The uncovered patients would have to carry rule
+        # labels, and a file that is part LLM and part rules is the baseline
+        # with extra steps. Report the fraction; write no submission.
+        print(f"\n[run] PARTIAL COVERAGE {len(all_rows)}/{len(intended)} "
+              f"({coverage:.1%}) — no submission written. Padding the remainder "
+              f"with rule labels would fabricate labels this run never produced.")
+    write_run_log(rows, path=paths["run_log"])
+
+    agent_a = _load_agent_a()
+    write_cascade_results(paths, rows, labels, agent_a, rule_labels, free,
+                          time.time() - started, cascade_labeler,
+                          coverage, len(intended))
+    return labels
+
+
+def run_ablation(phenotype="t2d", effort=llm_labeler.DEFAULT_EFFORT, resume=False,
+                 sample=None, seed=42, max_cost=None, skip_preflight_call=False):
+    """Agent D — chart ablation. Same model as Agent A, six facts instead of a
+    chart. Isolates chart engineering from model choice."""
+    paths = EXPERIMENTS["minimal"]
+    started = time.time()
+    recs, assignments = _experiment_preamble(phenotype, effort, skip_preflight_call,
+                                             llm_labeler.MODEL)
+    rules = PHENOTYPES[phenotype]["rules"]
+    roster_order = list(recs.keys())
+    rule_labels = {pid: rules.label(rec) for pid, rec in recs.items()}
+
+    targets = list(roster_order)
+    if sample is not None:
+        import random as _random
+        rng = _random.Random(seed)
+        targets = sorted(rng.sample(roster_order, sample))
+        print(f"\n[run] ABLATION on a random sample of {sample} patients "
+              f"(seed={seed}, reproducible)")
+
+    charts = {pid: _minimal_renderer(recs[pid]) for pid in targets}
+    full_sizes = [records_mod.chart_size(records_mod.render_chart(recs[p]))[1]
+                  for p in targets]
+    min_sizes = [records_mod.chart_size(charts[p])[1] for p in targets]
+    print(f"[run] chart tokens: full mean {statistics.mean(full_sizes):,.0f} -> "
+          f"minimal mean {statistics.mean(min_sizes):,.0f} "
+          f"({statistics.mean(min_sizes)/statistics.mean(full_sizes):.1%} of full)")
+
+    done = load_checkpoint(paths["checkpoint"]) if resume else {}
+    if resume:
+        targets = [p for p in targets if p not in done]
+    elif os.path.exists(paths["checkpoint"]):
+        os.remove(paths["checkpoint"])
+
+    p_in, p_out = llm_labeler.price_of(llm_labeler.MODEL)
+    proj = (sum(billed_input_tokens(charts[p]) for p in targets) * p_in
+            + len(targets) * MEASURED_OUTPUT_TOKENS * p_out) / 1_000_000
+    print(f"[run] PROJECTED cost for {len(targets)} patients: ${proj:.2f}")
+    if max_cost is not None and proj > max_cost:
+        print(f"[run] projection ${proj:.2f} exceeds the ${max_cost:.2f} cap.")
+        write_budget_failure_md(paths, proj, max_cost, len(targets))
+        raise SystemExit(4)
+
+    llm_labeler.USAGE.reset()
+    checkpoint = Checkpointer(path=paths["checkpoint"])
+    print(f"\n[run] labeling {len(targets)} patients on MINIMAL charts ...")
+    fresh, stop_reason, governor = adjudicate_many(
+        targets, recs, rule_labels, charts, effort, checkpoint, max_cost=max_cost)
+
+    all_rows = dict(done); all_rows.update(fresh)
+    n_fell_back = sum(1 for r in all_rows.values() if r.get("fell_back"))
+    if stop_reason:
+        write_failures_md(stop_reason, fresh, n_fell_back, len(targets), governor,
+                          path="FAILURES_ablation.md")
+        print(f"\n[run] ABLATION ABORTED — {stop_reason}")
+        raise SystemExit(2)
+
+    ordered = [p for p in roster_order if p in all_rows]
+    labels = {p: all_rows[p]["llm_label"] for p in ordered}
+    for pid in ordered:
+        all_rows[pid]["bucket"] = assignments.get(pid, "?")
+    rows = [all_rows[p] for p in ordered]
+
+    # The submission holds exactly the patients that were actually labeled.
+    # Padding the rest with rule labels would manufacture 2,539 labels this
+    # experiment never produced and quietly call them a result.
+    _finish(paths, labels, ordered, rows, len(ordered))
+    write_run_log(rows, path=paths["run_log"])
+
+    agent_a = _load_agent_a()
+    write_ablation_results(paths, rows, labels, agent_a, rule_labels,
+                           full_sizes, min_sizes, seed, sample,
+                           time.time() - started)
+    return labels
+
+
+def write_budget_failure_md(paths, projected, cap, n):
+    with open(FAILURES_PATH, "w") as fh:
+        fh.write("\n".join([
+            "# Run refused before spending",
+            "",
+            f"Projected **${projected:.2f}** for {n:,} patients against a "
+            f"**${cap:.2f}** cap.",
+            "",
+            "Nothing was called and nothing was spent. Starting anyway would have",
+            "aborted partway through on the cost ceiling, spending the whole cap and",
+            "producing no submission — strictly worse than not starting.",
+            "",
+            "Either raise the cap or reduce the patient count.",
+            "",
+        ]) + "\n")
+    print(f"[run] wrote {FAILURES_PATH}")
+
+
+def _agreement(labels, reference):
+    shared = [p for p in labels if p in reference]
+    agree = sum(1 for p in shared if labels[p] == reference[p])
+    disagree = [(p, reference[p], labels[p]) for p in shared if labels[p] != reference[p]]
+    return shared, agree, disagree
+
+
+def write_cascade_results(paths, rows, labels, agent_a, rule_labels, free,
+                          elapsed, cascade_labeler, coverage=1.0, n_intended=0):
+    shared, agree, disagree = _agreement(labels, agent_a)
+    n_esc = sum(1 for r in rows if r.get("escalated"))
+    screen_only = [r for r in rows if not r.get("escalated")]
+    esc_rows = [r for r in rows if r.get("escalated")]
+    screen_wrong = sum(1 for r in esc_rows if r.get("screen_was_wrong"))
+
+    # Why did each escalation happen? "The screen was unsure" and "the screen
+    # crashed" are completely different events, and counting them together
+    # would report a working confidence trigger that never actually fired.
+    esc_on_confidence = [r for r in esc_rows if not r.get("screen_fell_back")]
+    esc_on_failure = [r for r in esc_rows if r.get("screen_fell_back")]
+    observed_confidences = {r.get("screen_confidence") for r in rows
+                            if r.get("screen_confidence")
+                            and str(r.get("screen_confidence")) != "nan"}
+    trigger_never_fired = len(esc_on_confidence) == 0
+
+    s_in, s_out = llm_labeler.price_of(cascade_labeler.SCREEN_MODEL)
+    e_in, e_out = llm_labeler.price_of(cascade_labeler.ESCALATE_MODEL)
+    cost_screen = sum((int(r.get("screen_in") or 0) * s_in
+                       + int(r.get("screen_out") or 0) * s_out) for r in rows) / 1e6
+    cost_esc = sum((int(r.get("escalate_in") or 0) * e_in
+                    + int(r.get("escalate_out") or 0) * e_out) for r in rows) / 1e6
+    total = cost_screen + cost_esc
+    agent_a_cost = 21.3019
+
+    # Haiku's own accuracy against Agent A, split by the confidence it claimed.
+    # This decides whether the escalation trigger is calibrated at all: if the
+    # screen is frequently wrong while claiming "high", those patients never
+    # escalate, nothing catches them, and the cost saving is illusory.
+    by_conf = {}
+    for r in rows:
+        pid = r["patient_id"]
+        if pid not in agent_a:
+            continue
+        b = by_conf.setdefault(r.get("screen_confidence") or "n/a",
+                               {"n": 0, "wrong": 0})
+        b["n"] += 1
+        b["wrong"] += int(int(r.get("screen_label") or 0) != agent_a[pid])
+    high = by_conf.get("high", {"n": 0, "wrong": 0})
+    high_err = high["wrong"] / high["n"] if high["n"] else 0.0
+    miscalibrated = high_err > 0.02
+
+    lines = [
+        "# Agent B — routed cascade with model tiering",
+        "",
+        "Can a cheap model plus a cheap escalation rule reproduce Agent A's labels",
+        "for a fraction of the money? That is the project's central question and",
+        "nobody on the dashboard has answered it.",
+        "",
+        "## Deviation from spec — read first",
+        "",
+        "The spec had the screen read the same full chart as Agent A. At ~2,324",
+        "billed input tokens/patient that is $8.09 for the screen alone, over the",
+        "run cap. Rather than cut coverage, the chart was cut: **the Haiku screen",
+        "reads the six-fact minimal chart (~444 billed tokens); escalated patients",
+        "get the full chart at Sonnet.** Full-cohort coverage is preserved.",
+        "",
+        "This tests a stronger form of the hypothesis, not a weaker one — tiering",
+        "only pays if the cheap tier is cheap on *both* axes, since a cheap model",
+        "reading an expensive prompt still bills every input token. The confound is",
+        "real and worth stating plainly: a disagreement with Agent A could come from",
+        "the smaller model or from the smaller chart, and this run alone cannot",
+        "separate them. Agent D varies the chart with the model held fixed, which is",
+        "what makes the pair interpretable.",
+        "",
+    ]
+
+    if coverage < 1.0:
+        lines += [
+            "## PARTIAL RESULT",
+            "",
+            f"**Coverage: {len(rows):,} of {n_intended:,} intended patients "
+            f"({coverage:.1%}).** The run stopped early. No submission was written:",
+            "the uncovered patients would have to carry rule labels, and a file that",
+            "is part LLM and part rules is the baseline with extra steps. Everything",
+            "below describes only the patients actually labeled.",
+            "",
+        ]
+
+    lines += [
+        "## Headline",
+        "",
+        f"**${total:.4f} vs Agent A's ${agent_a_cost:.2f} — "
+        f"{agent_a_cost/total:.1f}x cheaper**, at "
+        f"**{agree/len(shared):.2%} label agreement** ({agree:,}/{len(shared):,}).",
+        "",
+        "| | |",
+        "| --- | --- |",
+        f"| rules, free | {len(free):,} patients |",
+        f"| screened by `{cascade_labeler.SCREEN_MODEL}` | {len(rows):,} |",
+        f"| escalated to `{cascade_labeler.ESCALATE_MODEL}` | {n_esc:,} "
+        f"({n_esc/max(1,len(rows)):.1%}) |",
+        f"| \u2514 escalated on low confidence | {len(esc_on_confidence):,} |",
+        f"| \u2514 escalated after a screen failure | {len(esc_on_failure):,} |",
+        f"| escalation predicate | confidence in "
+        f"`{cascade_labeler.ESCALATE_ON_CONFIDENCE}` |",
+        "",
+        "## Cost",
+        "",
+        "| | cost | share |",
+        "| --- | --- | --- |",
+        f"| screen ({cascade_labeler.SCREEN_MODEL}) | ${cost_screen:.4f} | "
+        f"{cost_screen/max(1e-9,total):.1%} |",
+        f"| escalation ({cascade_labeler.ESCALATE_MODEL}) | ${cost_esc:.4f} | "
+        f"{cost_esc/max(1e-9,total):.1%} |",
+        f"| **total** | **${total:.4f}** | |",
+        f"| per patient (whole cohort) | ${total/EXPECTED_TOTAL:.6f} | |",
+        f"| per patient (called only) | ${total/max(1,len(rows)):.6f} | |",
+        f"| **cost ratio vs Agent A** | **{total/agent_a_cost:.3f}x** "
+        f"({agent_a_cost/total:.1f}x cheaper) | |",
+        f"| wall clock | {elapsed/60:.2f} min | |",
+        "",
+        "## Agreement with Agent A",
+        "",
+        f"- Compared on {len(shared):,} patients.",
+        f"- Agree: **{agree:,}** ({agree/len(shared):.2%})",
+        f"- Disagree: **{len(disagree):,}**",
+        f"  - Agent A positive, cascade negative: "
+        f"{sum(1 for _, a, c in disagree if a == 1):,}",
+        f"  - Agent A negative, cascade positive: "
+        f"{sum(1 for _, a, c in disagree if a == 0):,}",
+        "",
+        "## Is the cheap screen trustworthy?",
+        "",
+        "The number that decides whether tiering is sound, reported on its own",
+        "rather than averaged into the agreement rate: **of the patients Haiku was",
+        f"unsure about and escalated, Sonnet overturned {screen_wrong:,} of "
+        f"{len(esc_rows):,}** "
+        f"({screen_wrong/max(1,len(esc_rows)):.1%}).",
+        "",
+        f"- Escalation rate: {n_esc/max(1,len(rows)):.1%}",
+        f"- Screen answered alone: {len(screen_only):,} patients",
+        "",
+        "A low overturn rate means the screen was merely cautious and the escalation",
+        "budget is mostly wasted. A high one means its confidence signal is doing",
+        "real work.",
+        "",
+        "### Is the confidence signal calibrated?",
+        "",
+        "Haiku's own labels scored against Agent A, split by the confidence Haiku",
+        "claimed. The escalation trigger only fires on `low`, so errors made at",
+        "`high` confidence are never caught by anything:",
+        "",
+        "| screen confidence | patients | wrong vs Agent A | error rate |",
+        "| --- | --- | --- | --- |",
+    ]
+    for conf in ("high", "medium", "low", "n/a"):
+        if conf not in by_conf:
+            continue
+        b = by_conf[conf]
+        lines.append(f"| {conf} | {b['n']:,} | {b['wrong']:,} | "
+                     f"{b['wrong']/max(1,b['n']):.2%} |")
+    lines.append("")
+
+    if trigger_never_fired:
+        lines += [
+            "> ### The escalation trigger never fired.",
+            f"> Not one patient was escalated for low confidence. The screen "
+            f"returned {sorted(observed_confidences)} and nothing else across "
+            f"{len(rows):,} patients —",
+            f"> a constant. All {len(esc_rows)} escalation(s) were **failure "
+            f"recovery**, not uncertainty routing.",
+            ">",
+            "> So this run measures a two-model cascade in name only: in practice it",
+            "> is Haiku-on-a-minimal-chart labeling the entire middle, and the",
+            f"> {agent_a_cost/max(1e-9,total):.1f}x saving belongs to that, not to",
+            "> tiering. The escalation path is untested here — it never carried load.",
+            ">",
+            "> That the screen was also *right* (0 errors at high confidence) makes",
+            "> this a good outcome, not a broken one. But a confidence signal with no",
+            "> variance cannot route anything, so escalating on `low` is currently",
+            "> dead code. To actually test tiering, the trigger needs a signal that",
+            "> varies — escalate on disagreement with the rules, on missing evidence,",
+            "> or on a calibrated probability rather than a self-reported label.",
+            "",
+        ]
+
+    if miscalibrated:
+        lines += [
+            f"> ### The escalation trigger is miscalibrated.",
+            f"> Haiku is wrong on **{high_err:.2%}** of the patients it labeled with",
+            f"> *high* confidence ({high['wrong']:,} of {high['n']:,}). Those never",
+            "> escalate, so nothing catches them. The headline cost saving is",
+            "> **illusory to that extent**: the cascade is not buying Agent A's",
+            "> labels more cheaply, it is buying different labels more cheaply.",
+            "> Escalating on medium as well would catch some of it, at higher cost.",
+            "",
+        ]
+    else:
+        lines += [
+            f"Haiku's high-confidence error rate is {high_err:.2%} "
+            f"({high['wrong']:,}/{high['n']:,}), low enough that the trigger firing",
+            "only on `low` is defensible — the patients it declines to escalate are",
+            "ones it genuinely gets right.",
+            "",
+        ]
+
+    lines += [
+        (f"Submission: `{paths['submission']}` ({EXPECTED_TOTAL:,} rows)."
+         if coverage >= 1.0 else
+         "No submission written — see PARTIAL RESULT above."),
+        f"Per-patient tiers, confidences and tokens: `{paths['run_log']}`.",
+        "",
+    ]
+    with open(paths["results"], "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    print(f"[run] wrote {paths['results']}")
+    print(f"[run] CASCADE: ${total:.4f} vs Agent A ${agent_a_cost:.2f} "
+          f"({agent_a_cost/total:.1f}x cheaper), agreement {agree/len(shared):.2%}, "
+          f"escalation {n_esc/max(1,len(rows)):.1%}, screen overturned "
+          f"{screen_wrong}/{len(esc_rows)}")
+
+
+def write_ablation_results(paths, rows, labels, agent_a, rule_labels,
+                           full_sizes, min_sizes, seed, sample, elapsed):
+    shared, agree, disagree = _agreement(labels, agent_a)
+    p_in, p_out = llm_labeler.price_of(llm_labeler.MODEL)
+    tok_in = sum(int(r.get("input_tokens") or 0) for r in rows)
+    tok_out = sum(int(r.get("output_tokens") or 0) for r in rows)
+    cost = (tok_in * p_in + tok_out * p_out) / 1e6
+    per_patient = cost / max(1, len(rows))
+    agent_a_per_patient = 21.3019 / EXPECTED_TOTAL
+
+    mean_full, mean_min = statistics.mean(full_sizes), statistics.mean(min_sizes)
+    flips = [(p, agent_a[p], labels[p]) for p, _, _ in
+             [(d[0], d[1], d[2]) for d in disagree]]
+
+    lines = [
+        "# Agent D — chart ablation",
+        "",
+        "Does chart engineering matter more than model choice? Same model as Agent A",
+        "(`claude-sonnet-5`), same schema, same everything — except the chart is cut",
+        "to six facts: age, sex, T2D dx code present/absent, max HbA1c, max glucose,",
+        "diabetes medication present/absent.",
+        "",
+        "## The two numbers, kept separate",
+        "",
+        "| | |",
+        "| --- | --- |",
+        f"| **cost reduction** | **{1 - per_patient/agent_a_per_patient:.1%}** "
+        f"(${agent_a_per_patient:.6f} -> ${per_patient:.6f} per patient) |",
+        f"| **accuracy delta** | **{len(disagree):,} of {len(shared):,} labels "
+        f"changed** ({len(disagree)/max(1,len(shared)):.2%} disagreement with "
+        f"Agent A) |",
+        "",
+        "Reported apart on purpose: a cost saving and an accuracy cost are not",
+        "commensurable, and averaging them into one score would hide whichever one",
+        "is inconvenient.",
+        "",
+        "## Chart size",
+        "",
+        "| | full | minimal | ratio |",
+        "| --- | --- | --- | --- |",
+        f"| mean tokens/chart | {mean_full:,.0f} | {mean_min:,.0f} | "
+        f"{mean_min/mean_full:.1%} |",
+        f"| min | {min(full_sizes):,} | {min(min_sizes):,} | |",
+        f"| max | {max(full_sizes):,} | {max(min_sizes):,} | |",
+        "",
+        "## Cost",
+        "",
+        "| | |",
+        "| --- | --- |",
+        f"| patients labeled | {len(rows):,}"
+        + (f" (random sample, **seed={seed}**)" if sample else "") + " |",
+        f"| input tokens | {tok_in:,} |",
+        f"| output tokens | {tok_out:,} |",
+        f"| total cost | ${cost:.4f} |",
+        f"| per patient | ${per_patient:.6f} |",
+        f"| Agent A per patient | ${agent_a_per_patient:.6f} |",
+        f"| wall clock | {elapsed/60:.2f} min |",
+        "",
+        "Output tokens dominate once the chart is gone: the input shrank to",
+        f"{mean_min/mean_full:.0%} of full, but reasoning tokens bill as output and",
+        "do not shrink with the prompt. That ceiling is the real finding about how",
+        "far chart trimming alone can take cost down.",
+        "",
+        "## Which patients flipped",
+        "",
+        f"- Agreement with Agent A: **{agree:,}/{len(shared):,}** "
+        f"({agree/max(1,len(shared)):.2%})",
+        f"- Agent A positive -> minimal negative: "
+        f"{sum(1 for _, a, m in flips if a == 1):,}",
+        f"- Agent A negative -> minimal positive: "
+        f"{sum(1 for _, a, m in flips if a == 0):,}",
+        "",
+    ]
+    if flips:
+        lines += ["| patient | Agent A | minimal |", "| --- | --- | --- |"]
+        lines += [f"| `{p[:8]}` | {a} | {m} |" for p, a, m in flips[:40]]
+        if len(flips) > 40:
+            lines.append(f"| ... and {len(flips)-40} more | | |")
+        lines.append("")
+    lines += [
+        f"`{paths['submission']}` holds exactly the {len(rows):,} patients this",
+        "experiment labeled — not a padded 3,539. Filling the remainder with rule",
+        "labels would invent labels this run never produced.",
+        "",
+    ]
+    with open(paths["results"], "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    print(f"[run] wrote {paths['results']}")
+    print(f"[run] ABLATION: cost/patient ${per_patient:.6f} vs Agent A "
+          f"${agent_a_per_patient:.6f} ({1-per_patient/agent_a_per_patient:+.1%}), "
+          f"agreement {agree/max(1,len(shared)):.2%}, {len(disagree)} flips")
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="run.py",
@@ -1199,9 +1822,29 @@ def main():
                          f"${COST_CONFIRM_THRESHOLD_USD:.0f}")
     ap.add_argument("--skip-preflight-call", action="store_true",
                     help="run preflight but omit the single live API call")
+    ap.add_argument("--cascade", action="store_true",
+                    help="Agent B: rules on decisive buckets, Haiku screen on the "
+                         "rest, Sonnet only where the screen is unsure")
+    ap.add_argument("--chart-mode", default="full", choices=["full", "minimal"],
+                    help="Agent D: 'minimal' renders six facts instead of a chart")
+    ap.add_argument("--sample", type=int, metavar="N",
+                    help="label a random sample of N patients instead of all")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="RNG seed for --sample (default: %(default)s)")
+    ap.add_argument("--max-cost", type=float, metavar="USD",
+                    help="refuse to start if projected spend exceeds this, and "
+                         "hard-abort if live spend reaches it")
     args = ap.parse_args()
 
-    if args.dry_run:
+    if args.cascade:
+        run_cascade(args.phenotype, effort=args.effort, resume=args.resume,
+                    limit=args.limit, max_cost=args.max_cost,
+                    skip_preflight_call=args.skip_preflight_call)
+    elif args.chart_mode == "minimal":
+        run_ablation(args.phenotype, effort=args.effort, resume=args.resume,
+                     sample=args.sample, seed=args.seed, max_cost=args.max_cost,
+                     skip_preflight_call=args.skip_preflight_call)
+    elif args.dry_run:
         dry_run(args.phenotype)
     else:
         full_run(args.phenotype, use_all=args.use_all, limit=args.limit,

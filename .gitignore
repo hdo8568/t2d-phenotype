@@ -19,3 +19,6 @@ venv/
 outputs/
 .env*
 a.py
+
+# Raw model responses from failed parses — diagnostic scratch, not a deliverable
+parse_failures.log

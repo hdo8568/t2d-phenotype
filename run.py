@@ -104,10 +104,20 @@ EXPECTED_TOTAL = records_mod.EXPECTED_PATIENTS   # 3539
 TOKEN_CALIBRATION = 3.32
 MEASURED_OUTPUT_TOKENS = 133      # median per call, Agent A
 
+# Fixed per-call overhead: system prompt + user template + schema. MEASURED,
+# not guessed — a ~20-token stub chart bills 792 input tokens in preflight. The
+# earlier 300 was a guess and it under-projected short-chart runs by ~2x, which
+# matters enormously for the ablation: once the chart is tiny, this constant IS
+# the input cost.
+FIXED_INPUT_OVERHEAD = 770
+
+# What Agent D was asked for, so the report can flag when the budget forced less.
+ABLATION_REQUESTED_SAMPLE = 1000
+
 
 def billed_input_tokens(chart):
-    """Calibrated estimate of what one chart actually bills, system prompt in."""
-    return records_mod.chart_size(chart)[1] * TOKEN_CALIBRATION + 300
+    """Calibrated estimate of what one chart actually bills, overhead included."""
+    return records_mod.chart_size(chart)[1] * TOKEN_CALIBRATION + FIXED_INPUT_OVERHEAD
 
 
 PHENOTYPES = {
@@ -1715,6 +1725,27 @@ def write_ablation_results(paths, rows, labels, agent_a, rule_labels,
         "to six facts: age, sex, T2D dx code present/absent, max HbA1c, max glucose,",
         "diabetes medication present/absent.",
         "",
+    ]
+
+    if sample and sample < ABLATION_REQUESTED_SAMPLE:
+        lines += [
+            "## Deviation from spec — read first",
+            "",
+            f"**Sample is {sample:,}, not the requested "
+            f"{ABLATION_REQUESTED_SAMPLE:,}** (seed={seed}). Agent B spent $2.76 of",
+            "the $5 combined cap; 1,000 patients here priced at $2.93 against $2.24",
+            "remaining, so the sample was sized to the budget rather than the run",
+            "being started and aborted partway with nothing to show.",
+            "",
+            "The sample is random over the full roster with a fixed seed, so it is",
+            f"unbiased — but at n={sample:,} the agreement figure below carries a",
+            "sampling error of roughly ±1-2 points, which is the same order as the",
+            "effect being measured. Treat the cost numbers as precise and the",
+            "accuracy delta as directional.",
+            "",
+        ]
+
+    lines += [
         "## The two numbers, kept separate",
         "",
         "| | |",

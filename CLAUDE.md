@@ -18,7 +18,11 @@ python broad_codes.py  # enumerate diabetes-adjacent SNOMED codes + patient coun
 python provenance.py   # check encounters.csv patient IDs are a subset of patients.csv
 ```
 
-Requires `pandas`; `a.py` additionally needs `google-genai` and `python-dotenv`. There is no virtualenv in the repo — the system `python3` (3.14, pandas 3.0) has these installed.
+**Use `/Users/henry/miniforge3/bin/python3` for everything in this repo.** Bare `python3` resolves to 3.14 in some terminals and miniforge 3.13 in others, and only miniforge has both `pandas` and `anthropic` installed. A run that works in one terminal and `ModuleNotFoundError`s in another is this, every time.
+
+Requires `pandas`; `a.py` additionally needs `google-genai` and `python-dotenv`; `run.py` needs `anthropic`. There is no virtualenv in the repo.
+
+**pandas version.** miniforge has pandas 3.0.5, while `phenotype.py` was written against pandas 2.x. As of the last check the whole of `phenotype.py` runs clean under 3.0.5 — no warnings, no errors, and the regenerated `t2d_cohort.csv` is identical to the 2.x baseline (314 / 536 / 2689, 68 dropped). No 3.0 incompatibilities are known. If one turns up, **flag it and leave the behavior alone** — silently "fixing" a pandas difference would move the frozen baseline that everything else is measured against.
 
 `phenotype.py` reads `observations.csv` (~240 MB) and `encounters.csv` (~88 MB), so a full run takes a while. There is no incremental mode; iterating means editing the script and rerunning it whole. Output is print-heavy by design — the printed EDA blocks are the deliverable as much as the CSV.
 
@@ -131,6 +135,65 @@ Ages are computed against a fixed reference date (`2020-01-01`), not the diagnos
 ## Style
 
 The scripts are written as didactic, first-person research notes: dense inline commentary explaining *why* a step exists and what a result would mean, numbered stage banners, and generous blank-line separation between stages. Match that register — commentary that reasons about the data, not restatements of what the pandas call does.
+
+## Project context and architecture decisions
+
+### What the submissions are actually scored against
+
+Submissions are scored on a Streamlit dashboard against **silver standards derived from rule-based PheKB definitions**. The metric is therefore agreement with a set of rules, not clinical truth — a clinically correct label that the rules would not have produced still scores as an error. Every submission must cover **all 3539 patients**; uncovered patients are counted against the score, so a short file is strictly worse than a complete but imperfect one.
+
+All 22 submissions to date are deterministic (`cost_usd = 0`, `runtime_min <= 0.3`). **No LLM method has been submitted by anyone.**
+
+### T2D headroom is small and known
+
+The T2D silver standard is approximately "has a T2D dx code". 382 patients have one, ~319 are silver-positive, and the rules already call 314. The **68 dx-coded patients that fell to UNKNOWN hold the only remaining headroom (~5 flips)**. Patients with no T2D dx code are all silver-negative, so flagging them can only lower precision — worth remembering before any change that adds positives outside the coded set.
+
+### Resistant Hypertension is the open phenotype
+
+Best F1 on the board is 0.2227. 1126 patients carry HTN code `59621000`; implied silver positives ~212. Coherent stocks only 3 antihypertensives (lisinopril, HCTZ, amlodipine); 175 patients are on all 3 and **zero** on >= 4, which constrains any "resistant = on N+ agents" definition badly. The ~212 figure is **derived from dashboard arithmetic, not from Tim's actual key — treat it as unverified.**
+
+### Architecture: a routed cascade
+
+A **router** assigns each patient to exactly one labeler based on *what evidence exists in their record* — never on the phenotype label, which would leak the answer into the routing decision. Rules where the evidence is decisive, LLM where it conflicts or is indirect, abstain to negative where it is absent.
+
+The router, record builder, and scorer are **method-agnostic and shared across phenotypes**; only the rules module is phenotype-specific.
+
+| file | role |
+| --- | --- |
+| `records.py` | `build_records()` -> one record per patient, indexed off `patients.csv`. Also `render_chart()`. |
+| `router.py` | `route(record, rules)` -> one of five buckets. Asserts disjoint and covering. |
+| `labelers/rules.py` | wraps the PheKB logic; also supplies `ROUTE_PREDICATES` |
+| `labelers/llm.py` | one Claude call per patient, schema-validated verdict |
+| `run.py` | preflight, routing, labeling, submission, accounting |
+
+**The spine is `patients.csv`, always.** `conditions.csv` is missing 4 patients and `medications.csv` is missing 92; building the index off either silently drops them from the submission. `records.py` prints this coverage check on every run and preflight asserts it.
+
+The five buckets, and why `DECISIVE_POS` is not "the rules said yes": each predicate is a boolean expression over evidence presence (does a dx code exist, is an oral agent on file, is insulin on file, were labs abnormal, was glucose ever drawn). "Does a PheKB path close on this evidence?" is a question about the evidence's sufficiency, not about the patient's status.
+
+| bucket | T2D count | labeler |
+| --- | --- | --- |
+| `DECISIVE_POS` | 314 | rules |
+| `DECISIVE_NEG` | 536 | rules |
+| `CONFLICTING` | **68** | LLM |
+| `INDIRECT` | 1285 | rules |
+| `NO_EVIDENCE` | 1336 | rules |
+
+`CONFLICTING` is exactly the dx-coded patients where no path closes — the headroom set. `run.py` asserts it is 68.
+
+### Two run modes, and why the second exists
+
+- **cascade** (default): LLM sees only the 68. Caps F1 around 0.91, below three existing submissions.
+- **full cohort** (`--all`): every patient to the LLM. The goal here is *not* F1 — it is **measured cost and latency for a per-patient agentic method, plus divergence from the rules**. Since every existing submission reports `cost_usd = 0`, that measurement is the contribution.
+
+### Anti-silent-success rules
+
+A 3539-call run has many ways to produce a plausible result that means nothing. These are load-bearing, not decoration:
+
+- **Fallbacks are not agreement.** When the API fails, the patient falls back to its rule label — logged per patient, counted, and reported at the *top* of `RESULTS.md`. Above a 5% fallback rate the run stops and writes `FAILURES.md` instead of a submission, because a run that quietly falls back for 800 patients looks like a result and is not.
+- **Preflight before bulk.** One live API call proves the key and model string; a 401 or bad model stops the run instead of retrying 3539 times.
+- **Zero divergence is a headline, not a footnote.** If the LLM never disagrees with the rules, `RESULTS.md` says so at the top — it means the run bought nothing.
+- **Chart format is the control variable.** `diagnostic_reports.csv` (clinical notes) is present but `render_chart()` does **not** include notes by default. Turning them on changes token counts and makes runs non-comparable — do it as a deliberate, separate experiment.
+- Prompt caching is enabled on the system prompt, which is identical across calls. It is ~300 tokens against a 1024-token minimum, so **it caches nothing**; measured cache tokens are reported rather than a saving being assumed.
 
 ## Reference
 

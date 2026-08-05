@@ -98,7 +98,7 @@ def _group_records(df, key_col, keep):
     return out
 
 
-def build_records(verbose=True):
+def build_records(verbose=True, load_notes=True):
     """Assemble one record per patient. Returns {patient_id: record}.
 
     The record shape is deliberately flat and JSON-ish: dicts and lists of
@@ -164,8 +164,14 @@ def build_records(verbose=True):
                   f"  (missing {missing}){note}")
 
     # --- notes: present only in some exports ---------------------------------
+    # diagnostic_reports.csv is 172 MB and the chart does not render notes yet,
+    # so the runner switches this off. Loading it would cost time and memory on
+    # every run to populate a field nothing reads.
     notes_by_patient = {}
-    if os.path.exists(NOTES_FILE):
+    if not load_notes:
+        if verbose:
+            print("[records]   notes        (skipped by request — load_notes=False)")
+    elif os.path.exists(NOTES_FILE):
         notes = pd.read_csv(NOTES_FILE)
         text_col = next((c for c in ("TEXT", "NOTE", "REPORT", "DESCRIPTION")
                          if c in notes.columns), None)
@@ -177,6 +183,9 @@ def build_records(verbose=True):
             print(f"[records]   notes        {notes.shape} from {NOTES_FILE}")
     elif verbose:
         print(f"[records]   notes        (no {NOTES_FILE} — skipping, not an error)")
+    if verbose and notes_by_patient:
+        print("[records]   NOTE: notes are carried on the record but NOT rendered "
+              "into the chart — the chart format is frozen for comparability.")
 
     # --- per-table grouping ---------------------------------------------------
     # Dates stay as the raw ISO strings the CSVs carry. They are uniform within
@@ -260,8 +269,14 @@ def _fmt(rows, line, limit=None):
     return out
 
 
-def render_chart(record, mask=False, max_labs_per_code=4):
-    """Render one patient as plain text. Deterministic — same record, same bytes."""
+def render_chart(record, mask=False, max_labs_per_code=4, include_notes=False):
+    """Render one patient as plain text. Deterministic — same record, same bytes.
+
+    include_notes defaults to FALSE even when notes are present on the record.
+    The chart format is the experiment's control variable: a run whose charts
+    gained a notes section is not comparable to the run that measured token
+    counts without one. Turning notes on is a deliberate, separate experiment.
+    """
     d = record["demographics"]
     L = [f"PATIENT {record['id']}",
          f"  age {d['age_at_reference']} | {d['gender']} | {d['race']}/{d['ethnicity']}"
@@ -341,7 +356,7 @@ def render_chart(record, mask=False, max_labs_per_code=4):
     L += _fmt(sorted(plans, key=lambda p: p["START"]),
               lambda p: f"{p['START'][:10]}  {p['DESCRIPTION']}")
 
-    if record["notes"]:
+    if include_notes and record["notes"]:
         L.append("\nNOTES:")
         L += ["  " + " | ".join(str(v) for v in n.values()) for n in record["notes"][:5]]
 

@@ -1238,6 +1238,19 @@ EXPERIMENTS = {
     },
 }
 
+EXPERIMENTS["consensus"] = {
+    "checkpoint": "run_checkpoint_consensus.jsonl",
+    "run_log": "run_log_consensus.csv",
+    "results": "RESULTS_consensus.md",
+    "submission": "submission_consensus.csv",
+}
+EXPERIMENTS["portability"] = {
+    "checkpoint": "run_checkpoint_portability.jsonl",
+    "run_log": "run_log_portability.csv",
+    "results": "RESULTS_portability.md",
+    "submission": "submission_portability.csv",
+}
+
 AGENT_A_SUBMISSION = "submission.csv"
 AGENT_A_RUN_LOG = "run_log.csv"
 
@@ -1461,6 +1474,466 @@ def run_ablation(phenotype="t2d", effort=llm_labeler.DEFAULT_EFFORT, resume=Fals
                            full_sizes, min_sizes, seed, sample,
                            time.time() - started)
     return labels
+
+
+def run_consensus(phenotype="t2d", effort=llm_labeler.DEFAULT_EFFORT, resume=False,
+                  sample=400, seed=42, max_cost=None, skip_preflight_call=False):
+    """Agent E — replace self-reported confidence with measured vote disagreement."""
+    from labelers import consensus as consensus_labeler
+
+    paths = EXPERIMENTS["consensus"]
+    started = time.time()
+    recs, assignments = _experiment_preamble(phenotype, effort, skip_preflight_call,
+                                             consensus_labeler.SCREEN_MODEL)
+    rules = PHENOTYPES[phenotype]["rules"]
+    rule_labels = {pid: rules.label(rec) for pid, rec in recs.items()}
+
+    # Sample from the NON-DECISIVE bucket only. The decisive ones are resolved
+    # by rules for free and would pad the sample with patients no model ever
+    # sees, making any escalation rate look artificially low.
+    pool = [p for p in recs if assignments[p] not in ("DECISIVE_POS", "DECISIVE_NEG")]
+    import random as _random
+    rng = _random.Random(seed)
+    targets = sorted(rng.sample(pool, min(sample, len(pool))))
+    print(f"\n[run] CONSENSUS on {len(targets)} of {len(pool):,} non-decisive "
+          f"patients (seed={seed}), k={consensus_labeler.K_VOTES} votes at "
+          f"temperature {consensus_labeler.VOTE_TEMPERATURE}")
+
+    charts = {pid: _minimal_renderer(recs[pid]) for pid in targets}
+    full_charts = {pid: records_mod.render_chart(recs[pid]) for pid in targets}
+
+    intended = list(targets)
+    done = load_checkpoint(paths["checkpoint"]) if resume else {}
+    if resume:
+        targets = [p for p in targets if p not in done]
+    elif os.path.exists(paths["checkpoint"]):
+        os.remove(paths["checkpoint"])
+
+    s_in, s_out = llm_labeler.price_of(consensus_labeler.SCREEN_MODEL)
+    k = consensus_labeler.K_VOTES
+    proj = (sum(billed_input_tokens(charts[p]) for p in targets) * k * s_in
+            + len(targets) * k * MEASURED_OUTPUT_TOKENS * s_out) / 1_000_000
+    print(f"[run] PROJECTED screen cost ({k} votes each): ${proj:.2f}")
+    if max_cost is not None and proj > max_cost:
+        # Pre-made decision: shrink to fit rather than abort mid-run.
+        per = proj / max(1, len(targets))
+        n_fit = max(1, int(max_cost * 0.90 / per))
+        print(f"[run] over the ${max_cost:.2f} cap — shrinking {len(targets)} "
+              f"-> {n_fit} patients and continuing")
+        targets = targets[:n_fit]
+        intended = list(targets)
+        proj = per * n_fit
+
+    def adjudicate_consensus(record, rule_label, chart, eff, governor):
+        verdict, info = consensus_labeler.adjudicate(
+            record, rule_label=rule_label, chart=chart,
+            escalate_chart=full_charts.get(record["id"]), effort=eff,
+            governor=governor)
+        info["row_cost"] = consensus_labeler.cost_of(info)
+        return verdict, info
+
+    llm_labeler.USAGE.reset()
+    checkpoint = Checkpointer(path=paths["checkpoint"])
+    fresh, stop_reason, governor = adjudicate_many(
+        targets, recs, rule_labels, charts, effort, checkpoint,
+        adjudicate_fn=adjudicate_consensus, max_cost=max_cost)
+
+    all_rows = dict(done); all_rows.update(fresh)
+    coverage = len(all_rows) / max(1, len(intended))
+    ordered = [p for p in recs if p in all_rows]
+    labels = {p: all_rows[p]["llm_label"] for p in ordered}
+    rows = [all_rows[p] for p in ordered]
+    for p in ordered:
+        all_rows[p]["bucket"] = assignments.get(p, "?")
+
+    if stop_reason:
+        write_failures_md(stop_reason, fresh, sum(1 for r in rows if r.get("fell_back")),
+                          len(intended), governor, path="FAILURES_consensus.md")
+        print(f"\n[run] CONSENSUS stopped early — {stop_reason}")
+
+    if rows:
+        write_submissions(labels, ordered,
+                          formats=[(paths["submission"], "patient_id", "label")],
+                          expected_rows=len(ordered))
+        write_run_log(rows, path=paths["run_log"])
+        write_consensus_results(paths, rows, labels, _load_agent_a(), rule_labels,
+                                recs, assignments, coverage, len(intended),
+                                time.time() - started, consensus_labeler, seed)
+    return labels
+
+
+def write_consensus_results(paths, rows, labels, agent_a, rule_labels, recs,
+                            assignments, coverage, n_intended, elapsed,
+                            consensus_labeler, seed):
+    splits = {}
+    for r in rows:
+        splits[r.get("vote_split") or "?"] = splits.get(r.get("vote_split") or "?", 0) + 1
+    n_unan = sum(1 for r in rows if r.get("unanimous"))
+    n_esc = sum(1 for r in rows if r.get("escalated"))
+    shared, agree, disagree = _agreement(labels, agent_a)
+    cost = sum(float(r.get("row_cost") or 0) for r in rows)
+
+    # Does disagreement track anything a router could have keyed on?
+    def profile(pid):
+        f = rules_labeler.facts(recs[pid])
+        a1c = [float(l["VALUE"]) for l in recs[pid]["labs"]
+               if l["CODE"] in rules_labeler.A1C
+               and str(l["VALUE"]).replace(".", "", 1).isdigit()]
+        return {
+            "has_dx": f["t2dm_dx_count"] > 0,
+            "near_threshold": any(6.0 <= v <= 7.0 for v in a1c),
+            "bucket": assignments.get(pid, "?"),
+        }
+
+    # Genuine disagreement only. A vote that failed and got escalated is not
+    # the model being unsure — it is the API being unreliable, and folding the
+    # two together would report a working signal that never fired.
+    def _genuine(r):
+        if r.get("genuine_split") is not None:
+            return bool(int(r.get("genuine_split") or 0))
+        return not r.get("unanimous") and not r.get("screen_fell_back")
+
+    split_rows = [r for r in rows if _genuine(r)]
+    failure_escalations = [r for r in rows
+                           if r.get("escalated") and not _genuine(r)]
+    prof_split = [profile(r["patient_id"]) for r in split_rows]
+    prof_all = [profile(r["patient_id"]) for r in rows]
+
+    def rate(profs, key):
+        return sum(1 for p in profs if p[key]) / len(profs) if profs else 0.0
+
+    degenerate = len(split_rows) == 0
+
+    lines = [
+        "# Agent E — a routing signal that actually varies",
+        "",
+        "Agent B escalated on the model's self-reported confidence, and that signal",
+        "turned out to be the constant `high` on 2,686 of 2,686 screens. This run",
+        "replaces it with a *measured* one: ask the cheap model the same question",
+        f"k={consensus_labeler.K_VOTES} times at temperature "
+        f"{consensus_labeler.VOTE_TEMPERATURE} and escalate only when the votes",
+        "disagree. Sampling disagreement cannot be rounded up to `high` by a model",
+        "describing itself.",
+        "",
+    ]
+
+    if degenerate:
+        lines += [
+            "> ### Every patient voted unanimously. This signal is constant too.",
+            f"> All {len(rows):,} patients agreed with themselves "
+            f"{consensus_labeler.K_VOTES}-0. Not one genuine split.",
+            f"> ({len(failure_escalations)} patient(s) did escalate — but on a "
+            f"FAILED vote, not a disagreement. That is API flakiness, not",
+            "> uncertainty, and it is counted separately here for the same reason",
+            "> Agent B's escalations had to be: a failure dressed as a signal is",
+            "> how you conclude that a dead trigger works.)",
+            ">",
+            "> Same dead trigger as Agent B, reached by a different route and at",
+            f"> {consensus_labeler.K_VOTES}x the screening cost.",
+            ">",
+            "> This is a result, not a failure. It says the decision boundary is",
+            "> nowhere near these patients: the task, as posed by the six-fact chart,",
+            "> is easy enough that temperature-1.0 sampling cannot separate anything.",
+            "> Uncertainty-based routing has now failed twice for the same underlying",
+            "> reason — the model is not uncertain. Any future router should key on",
+            "> evidence structure (as the rule-based router already does), not on the",
+            "> model's opinion of its own answer, however that opinion is elicited.",
+            "",
+        ]
+    else:
+        lines += [
+            f"> **{len(split_rows):,} of {len(rows):,} patients "
+            f"({len(split_rows)/len(rows):.1%}) split their votes** — the signal",
+            "> varies, unlike Agent B's self-reported confidence.",
+            "",
+        ]
+
+    if coverage < 1.0:
+        lines += [
+            "## PARTIAL RESULT", "",
+            f"**Coverage {len(rows):,}/{n_intended:,} ({coverage:.1%})** — the run "
+            f"stopped early. Figures below describe only the patients labeled.", "",
+        ]
+
+    lines += [
+        "## Vote splits",
+        "",
+        "| split | patients | share |",
+        "| --- | --- | --- |",
+    ]
+    for sp, n in sorted(splits.items(), key=lambda kv: -kv[1]):
+        lines.append(f"| {sp} | {n:,} | {n/len(rows):.1%} |")
+    lines += [
+        "",
+        f"- Unanimous: **{n_unan:,}/{len(rows):,}** ({n_unan/len(rows):.1%})",
+        f"- Escalated to `{consensus_labeler.ESCALATE_MODEL}`: **{n_esc:,}** "
+        f"({n_esc/len(rows):.1%})",
+        "",
+        "## Cost",
+        "",
+        "| | |",
+        "| --- | --- |",
+        f"| patients | {len(rows):,} (sample of the non-decisive bucket, seed={seed}) |",
+        f"| total | ${cost:.4f} |",
+        f"| per patient | ${cost/max(1,len(rows)):.6f} |",
+        f"| vs Agent A per patient | ${21.3019/EXPECTED_TOTAL:.6f} |",
+        f"| vs Agent B per patient | ${2.7606/2689:.6f} |",
+        f"| wall clock | {elapsed/60:.2f} min |",
+        "",
+        f"Voting k={consensus_labeler.K_VOTES} times triples the screening cost. "
+        f"With no splits to escalate, that is {consensus_labeler.K_VOTES}x spend for",
+        "zero routing decisions — the cost of finding out that the signal is flat.",
+        "",
+        "## Agreement with Agent A",
+        "",
+        f"- Compared on {len(shared):,} patients",
+        f"- Agree: **{agree:,}** ({agree/max(1,len(shared)):.2%})",
+        f"- Disagree: **{len(disagree):,}**",
+        "",
+        "## Does disagreement correlate with anything?",
+        "",
+        "| feature | split-vote patients | all patients |",
+        "| --- | --- | --- |",
+        f"| has a T2D dx code | {rate(prof_split,'has_dx'):.1%} | "
+        f"{rate(prof_all,'has_dx'):.1%} |",
+        f"| A1c in 6.0-7.0 (near the 6.5 threshold) | "
+        f"{rate(prof_split,'near_threshold'):.1%} | "
+        f"{rate(prof_all,'near_threshold'):.1%} |",
+        "",
+    ]
+    if degenerate:
+        lines += [
+            "Vacuous: with zero split-vote patients there is nothing to correlate.",
+            "The columns are left in so the shape of the intended analysis is visible.",
+            "",
+        ]
+    lines += [
+        f"`{paths['submission']}` is an experiment artifact covering the "
+        f"{len(rows):,} sampled patients only — not a scoreable submission, and not",
+        "padded with rule labels.",
+        "",
+    ]
+    with open(paths["results"], "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    print(f"[run] wrote {paths['results']}")
+    print(f"[run] CONSENSUS: {n_unan}/{len(rows)} unanimous, {n_esc} escalated, "
+          f"${cost:.4f}, agreement {agree/max(1,len(shared)):.2%}")
+
+
+def _f1(pred, truth, ids):
+    """F1 of pred against truth over `ids`, treating Agent A's labels as truth."""
+    tp = sum(1 for p in ids if pred.get(p) == 1 and truth.get(p) == 1)
+    fp = sum(1 for p in ids if pred.get(p) == 1 and truth.get(p) == 0)
+    fn = sum(1 for p in ids if pred.get(p) == 0 and truth.get(p) == 1)
+    prec = tp / (tp + fp) if (tp + fp) else 0.0
+    rec = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+    return {"tp": tp, "fp": fp, "fn": fn, "precision": prec, "recall": rec, "f1": f1}
+
+
+def run_portability(phenotype="t2d", effort=llm_labeler.DEFAULT_EFFORT, resume=False,
+                    sample=600, seed=42, max_cost=None, skip_preflight_call=False):
+    """Agent F — does the method survive a different schema and vocabulary?"""
+    paths = EXPERIMENTS["portability"]
+    started = time.time()
+
+    if not os.path.isdir("mangled"):
+        raise SystemExit("./mangled/ missing — run `python mangle.py` first.")
+
+    recs, assignments = _experiment_preamble(phenotype, effort, skip_preflight_call,
+                                             llm_labeler.MODEL)
+    rules = PHENOTYPES[phenotype]["rules"]
+    agent_a = _load_agent_a()
+
+    # --- how does the RULES labeler break? Both ways, reported separately. ---
+    print("\n[run] === RULES against ./mangled/ ===")
+    raw_error = None
+    try:
+        records_mod.build_records(verbose=False, load_notes=False, data_dir="mangled")
+        raw_error = "none — loaded unexpectedly"
+    except Exception as exc:  # noqa: BLE001
+        raw_error = f"{type(exc).__name__}: {exc}"
+    print(f"  no integration layer -> {raw_error[:120]}")
+
+    mangled_recs = records_mod.build_records(
+        verbose=False, load_notes=False, data_dir="mangled",
+        column_map=records_mod.MANGLED_COLUMN_MAP)
+    rules_mangled = {p: rules.label(r) for p, r in mangled_recs.items()}
+    rules_clean = {p: rules.label(r) for p, r in recs.items()}
+    all_ids = list(recs)
+    f1_rules_clean = _f1(rules_clean, agent_a, all_ids)
+    f1_rules_mangled = _f1(rules_mangled, agent_a, all_ids)
+    print(f"  with integration layer -> loaded {len(mangled_recs):,} records, "
+          f"{sum(rules_mangled.values())} positives "
+          f"(clean: {sum(rules_clean.values())})")
+    print(f"  rules F1: clean {f1_rules_clean['f1']:.4f} -> "
+          f"mangled {f1_rules_mangled['f1']:.4f}")
+
+    # --- LLM on the same patients, clean vs mangled -------------------------
+    import random as _random
+    rng = _random.Random(seed)
+    targets = sorted(rng.sample(all_ids, min(sample, len(all_ids))))
+    rule_labels = {p: rules_clean[p] for p in all_ids}
+
+    clean_charts = {p: records_mod.render_chart_portable(recs[p]) for p in targets}
+    mangled_charts = {p: records_mod.render_chart_portable(mangled_recs[p])
+                      for p in targets}
+
+    p_in, p_out = llm_labeler.price_of(llm_labeler.MODEL)
+    per = (statistics.mean([billed_input_tokens(c) for c in clean_charts.values()])
+           * p_in + MEASURED_OUTPUT_TOKENS * p_out) / 1_000_000
+    proj = per * len(targets) * 2       # two arms
+    print(f"\n[run] PROJECTED for {len(targets)} x 2 arms: ${proj:.2f}")
+    if max_cost is not None and proj > max_cost:
+        n_fit = max(1, int(max_cost * 0.90 / (per * 2)))
+        print(f"[run] over the ${max_cost:.2f} cap — shrinking {len(targets)} "
+              f"-> {n_fit} per arm and continuing")
+        targets = targets[:n_fit]
+        clean_charts = {p: clean_charts[p] for p in targets}
+        mangled_charts = {p: mangled_charts[p] for p in targets}
+
+    def arm(name, charts, source_recs):
+        ck = paths["checkpoint"].replace(".jsonl", f"_{name}.jsonl")
+        done = load_checkpoint(ck) if resume else {}
+        todo = [p for p in targets if p not in done]
+        if not resume and os.path.exists(ck):
+            os.remove(ck)
+            done = {}
+            todo = list(targets)
+        print(f"\n[run] arm '{name}': {len(todo)} to label "
+              f"({len(done)} from checkpoint)")
+        cp = Checkpointer(path=ck)
+        fresh, stop, gov = adjudicate_many(todo, source_recs, rule_labels, charts,
+                                           effort, cp, max_cost=max_cost)
+        rows = dict(done); rows.update(fresh)
+        return rows, stop
+
+    llm_labeler.USAGE.reset()
+    clean_rows, stop_c = arm("clean", clean_charts, recs)
+    mangled_rows, stop_m = arm("mangled", mangled_charts, mangled_recs)
+
+    covered = [p for p in targets if p in clean_rows and p in mangled_rows]
+    llm_clean = {p: clean_rows[p]["llm_label"] for p in covered}
+    llm_mangled = {p: mangled_rows[p]["llm_label"] for p in covered}
+    f1_llm_clean = _f1(llm_clean, agent_a, covered)
+    f1_llm_mangled = _f1(llm_mangled, agent_a, covered)
+    f1_rules_sub = _f1(rules_mangled, agent_a, covered)
+    f1_rules_clean_sub = _f1(rules_clean, agent_a, covered)
+
+    rows_all = list(clean_rows.values()) + list(mangled_rows.values())
+    cost = sum(float(r.get("row_cost") or 0) for r in rows_all)
+    write_run_log(rows_all, path=paths["run_log"])
+    if covered:
+        write_submissions(llm_mangled, covered,
+                          formats=[(paths["submission"], "patient_id", "label")],
+                          expected_rows=len(covered))
+
+    write_portability_results(
+        paths, covered, targets, seed, raw_error, cost, time.time() - started,
+        f1_rules_clean, f1_rules_mangled, f1_rules_clean_sub, f1_rules_sub,
+        f1_llm_clean, f1_llm_mangled, llm_clean, llm_mangled, agent_a,
+        rules_mangled, clean_charts, mangled_charts,
+        stop_c or stop_m, len(all_ids))
+    return llm_mangled
+
+
+def write_portability_results(paths, covered, targets, seed, raw_error, cost,
+                              elapsed, f1_rc, f1_rm, f1_rc_sub, f1_rm_sub,
+                              f1_lc, f1_lm, llm_clean, llm_mangled, agent_a,
+                              rules_mangled, clean_charts, mangled_charts,
+                              stopped, n_all):
+    delta = f1_lm["f1"] - f1_lc["f1"]
+    flips = [p for p in covered if llm_clean[p] != llm_mangled[p]]
+    lines = [
+        "# Agent F — cross-schema portability",
+        "",
+        "The stated reason to prefer LLM phenotyping over feature-engineered ML is",
+        "that it ports across institutions with varying schemas (Tim, 7/29). That",
+        "claim is untestable on one dataset, so `mangle.py` builds a second one:",
+        "the same patients and the same clinical facts wearing a different schema",
+        "and a different coding system.",
+        "",
+        "## The confound, stated up front",
+        "",
+        "**The LLM still reads the descriptions.** `mangle.py` renames every column,",
+        "remaps every SNOMED/RxNorm/LOINC code to an arbitrary local integer, and",
+        "deletes `careplans.csv` — but it leaves `DESCRIPTION` text intact. So this",
+        "measures robustness to **schema and vocabulary drift**, not to information",
+        "loss. A site that ships codes with no readable descriptions would defeat",
+        "the LLM as thoroughly as it defeats the rules, and this experiment says",
+        "nothing about that case.",
+        "",
+        "That is the realistic case, though: extracts differ in column names and",
+        "local code systems far more often than they omit human-readable text.",
+        "",
+        "## How the rules break",
+        "",
+        "Two distinct failures, and the second is the dangerous one:",
+        "",
+        f"1. **Without an integration layer — hard exception.** `{raw_error[:110]}`",
+        "   Loud, immediate, impossible to miss.",
+        "2. **With a column map — silent zero-match.** The records load cleanly, all",
+        f"   {n_all:,} of them, and every `.isin(T2D_DX)` test returns nothing",
+        "   because `44054006` is now `700xxx`. No exception, no warning: the",
+        f"   algorithm reports **{sum(rules_mangled.values())} cases** and looks",
+        "   like it ran successfully.",
+        "",
+        "A phenotype that fails loudly can be fixed. One that returns a clean,",
+        "confident, empty cohort is the failure mode that gets published.",
+        "",
+        "## Results",
+        "",
+        f"F1 against Agent A's labels, on the {len(covered):,} sampled patients "
+        f"(seed={seed}):",
+        "",
+        "| method | F1 | precision | recall | vs clean |",
+        "| --- | --- | --- | --- | --- |",
+        f"| rules, clean schema | {f1_rc_sub['f1']:.4f} | "
+        f"{f1_rc_sub['precision']:.4f} | {f1_rc_sub['recall']:.4f} | — |",
+        f"| **rules, mangled** | **{f1_rm_sub['f1']:.4f}** | "
+        f"{f1_rm_sub['precision']:.4f} | {f1_rm_sub['recall']:.4f} | "
+        f"**{f1_rm_sub['f1']-f1_rc_sub['f1']:+.4f}** |",
+        f"| LLM, clean schema | {f1_lc['f1']:.4f} | {f1_lc['precision']:.4f} | "
+        f"{f1_lc['recall']:.4f} | — |",
+        f"| **LLM, mangled** | **{f1_lm['f1']:.4f}** | {f1_lm['precision']:.4f} | "
+        f"{f1_lm['recall']:.4f} | **{delta:+.4f}** |",
+        "",
+        f"**Degradation delta: rules {f1_rm_sub['f1']-f1_rc_sub['f1']:+.4f}, "
+        f"LLM {delta:+.4f}.**",
+        "",
+        f"- Labels changed by mangling (LLM): **{len(flips)}** of {len(covered):,} "
+        f"({len(flips)/max(1,len(covered)):.2%})",
+        f"- Whole-cohort rules F1: clean {f1_rc['f1']:.4f} -> mangled "
+        f"{f1_rm['f1']:.4f}",
+        "",
+        "## Cost",
+        "",
+        "| | |",
+        "| --- | --- |",
+        f"| LLM calls | {len(covered)*2:,} ({len(covered):,} per arm) |",
+        f"| total | ${cost:.4f} |",
+        f"| per patient per arm | ${cost/max(1,len(covered)*2):.6f} |",
+        f"| rules, both arms | $0.0000 |",
+        f"| wall clock | {elapsed/60:.2f} min |",
+        "",
+        "`mangle.py` itself makes zero API calls, and so does the rules arm.",
+        "",
+    ]
+    if stopped:
+        lines[3:3] = ["> **PARTIAL** — a run stopped early; figures cover only the "
+                      "patients labeled in both arms.", ""]
+    lines += [
+        f"`{paths['submission']}` holds the mangled-arm labels for the "
+        f"{len(covered):,} sampled patients — an experiment artifact, not a",
+        "scoreable submission, and not padded.",
+        "",
+    ]
+    with open(paths["results"], "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    print(f"[run] wrote {paths['results']}")
+    print(f"[run] PORTABILITY: rules {f1_rc_sub['f1']:.4f}->{f1_rm_sub['f1']:.4f}, "
+          f"LLM {f1_lc['f1']:.4f}->{f1_lm['f1']:.4f} (delta {delta:+.4f}), "
+          f"{len(flips)} label flips, ${cost:.4f}")
 
 
 def write_budget_failure_md(paths, projected, cap, n):
@@ -1862,12 +2335,28 @@ def main():
                     help="label a random sample of N patients instead of all")
     ap.add_argument("--seed", type=int, default=42,
                     help="RNG seed for --sample (default: %(default)s)")
+    ap.add_argument("--consensus", action="store_true",
+                    help="Agent E: k-vote consensus screen, escalate on split votes")
+    ap.add_argument("--portability", action="store_true",
+                    help="Agent F: run against ./mangled/ and compare")
+    ap.add_argument("--data-dir", default=".",
+                    help="directory to read the CSVs from (default: %(default)s)")
     ap.add_argument("--max-cost", type=float, metavar="USD",
                     help="refuse to start if projected spend exceeds this, and "
                          "hard-abort if live spend reaches it")
     args = ap.parse_args()
 
-    if args.cascade:
+    if args.consensus:
+        run_consensus(args.phenotype, effort=args.effort, resume=args.resume,
+                      sample=args.sample or 400, seed=args.seed,
+                      max_cost=args.max_cost,
+                      skip_preflight_call=args.skip_preflight_call)
+    elif args.portability:
+        run_portability(args.phenotype, effort=args.effort, resume=args.resume,
+                        sample=args.sample or 600, seed=args.seed,
+                        max_cost=args.max_cost,
+                        skip_preflight_call=args.skip_preflight_call)
+    elif args.cascade:
         run_cascade(args.phenotype, effort=args.effort, resume=args.resume,
                     limit=args.limit, max_cost=args.max_cost,
                     skip_preflight_call=args.skip_preflight_call)

@@ -197,8 +197,31 @@ _parse_log_lock = threading.Lock()
 # Feature degradation. If the API rejects a request parameter, we turn that
 # parameter off once, globally, and carry on rather than failing 3539 times in
 # a row. Reported by the runner so a degraded run is never mistaken for clean.
-FEATURES = {"effort": True, "structured_output": True, "caching": True}
+def _default_features(model):
+    """Per-model, not global. Agent B disabled 'effort' because Haiku rejects
+    it — and that switched it off for the Sonnet escalations too, silently
+    changing the strong model's behavior because the cheap one complained.
+    Capability is a property of the model, so the flags are keyed by model.
+
+    Haiku is seeded as unsupported up front rather than learned from a 400:
+    the round trip is free to skip and the rejection is already known."""
+    supports_effort = not model.startswith("claude-haiku")
+    return {"effort": supports_effort, "structured_output": True, "caching": True}
+
+
+FEATURES_BY_MODEL = {}
 _features_lock = threading.Lock()
+
+
+def features_for(model):
+    with _features_lock:
+        if model not in FEATURES_BY_MODEL:
+            FEATURES_BY_MODEL[model] = _default_features(model)
+        return dict(FEATURES_BY_MODEL[model])
+
+
+# Back-compat view for callers that only ever used the default model.
+FEATURES = _default_features(MODEL)
 
 # Bumped every time a feature is disabled. Without it, feature degradation is
 # only safe for the ONE worker that happens to trip the 400 first: it flips the
@@ -281,7 +304,7 @@ def is_fatal(exc):
     return False
 
 
-def _degrade_on_bad_request(exc):
+def _degrade_on_bad_request(exc, model):
     """A 400 usually means a parameter this SDK/model pair does not accept.
     Turn that feature off once and let the caller retry, rather than losing the
     whole run to one unsupported field."""
@@ -291,14 +314,15 @@ def _degrade_on_bad_request(exc):
     global _features_version
     msg = str(exc).lower()
     with _features_lock:
+        feats = FEATURES_BY_MODEL.setdefault(model, _default_features(model))
         for key, needles in (("effort", ("effort",)),
                              ("structured_output", ("output_config", "json_schema", "format")),
                              ("caching", ("cache_control", "cache"))):
-            if FEATURES[key] and any(n in msg for n in needles):
-                FEATURES[key] = False
+            if feats[key] and any(n in msg for n in needles):
+                feats[key] = False
                 _features_version += 1
-                print(f"[llm] API rejected '{key}' — disabling it for the rest "
-                      f"of this run and retrying. ({exc})")
+                print(f"[llm] {model} rejected '{key}' — disabling it for that "
+                      f"model for the rest of this run and retrying. ({exc})")
                 return True
     return False
 
@@ -316,11 +340,11 @@ def _retry_after(exc, attempt):
                MAX_DELAY_SECONDS)
 
 
-def _build_request(chart, effort, model=MODEL):
-    with _features_lock:
-        use_effort = FEATURES["effort"]
-        use_structured = FEATURES["structured_output"]
-        use_cache = FEATURES["caching"]
+def _build_request(chart, effort, model=MODEL, temperature=None):
+    feats = features_for(model)
+    use_effort = feats["effort"]
+    use_structured = feats["structured_output"]
+    use_cache = feats["caching"]
 
     system_block = {"type": "text", "text": SYSTEM_PROMPT}
     if use_cache:
@@ -345,6 +369,11 @@ def _build_request(chart, effort, model=MODEL):
         )
     if output_config:
         kwargs["output_config"] = output_config
+    if temperature is not None:
+        # Sampling variation is the entire point for consensus voting: three
+        # calls at temperature 0 would be three copies of one opinion, and a
+        # unanimous vote would mean nothing.
+        kwargs["temperature"] = temperature
     return kwargs
 
 
@@ -389,7 +418,7 @@ def _parse_verdict(text):
 
 
 def adjudicate(record, rule_label=0, chart=None, render=None, effort=DEFAULT_EFFORT,
-               governor=None, model=MODEL):
+               governor=None, model=MODEL, temperature=None):
     """One patient, one call (plus retries). Returns a Verdict.
 
     `rule_label` is the fallback answer, used only if every attempt fails. It is
@@ -412,7 +441,8 @@ def adjudicate(record, rule_label=0, chart=None, render=None, effort=DEFAULT_EFF
             if governor is not None:
                 governor.acquire()
             try:
-                response = client.messages.create(**_build_request(chart, effort, model))
+                response = client.messages.create(
+                    **_build_request(chart, effort, model, temperature))
             finally:
                 if governor is not None:
                     governor.release()
@@ -468,7 +498,7 @@ def adjudicate(record, rule_label=0, chart=None, render=None, effort=DEFAULT_EFF
                     governor.note_rate_limit()
 
             try:
-                if _degrade_on_bad_request(exc):
+                if _degrade_on_bad_request(exc, model):
                     continue          # same attempt budget, one fewer feature
                 # Another worker disabled the offending feature while this
                 # request was in flight. The request we sent is stale, not

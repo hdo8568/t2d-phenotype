@@ -98,7 +98,25 @@ def _group_records(df, key_col, keep):
     return out
 
 
-def build_records(verbose=True, load_notes=True):
+# The minimal integration layer a receiving site would actually write: a map
+# from the foreign extract's column names back to the canonical ones. Supplying
+# it is what separates "we could not open the file" from "we opened the file and
+# every code lookup silently returned nothing" — and only the second is an
+# interesting result about phenotype portability.
+MANGLED_COLUMN_MAP = {
+    "subject_ref": "PATIENT", "row_uid": "Id", "concept_id": "CODE",
+    "concept_name": "DESCRIPTION", "result_val": "VALUE", "result_units": "UNITS",
+    "eff_start": "START", "eff_end": "STOP", "svc_date": "DATE",
+    "visit_ref": "ENCOUNTER", "visit_kind": "ENCOUNTERCLASS",
+    "reason_concept_id": "REASONCODE", "reason_name": "REASONDESCRIPTION",
+    "dob": "BIRTHDATE", "dod": "DEATHDATE", "sex_code": "GENDER",
+    "race_code": "RACE", "ethnicity_code": "ETHNICITY",
+    "marital_code": "MARITAL", "obs_kind": "TYPE", "city_name": "CITY",
+    "state_name": "STATE",
+}
+
+
+def build_records(verbose=True, load_notes=True, data_dir=".", column_map=None):
     """Assemble one record per patient. Returns {patient_id: record}.
 
     The record shape is deliberately flat and JSON-ish: dicts and lists of
@@ -106,24 +124,46 @@ def build_records(verbose=True, load_notes=True):
     able to hand a record straight to a renderer without knowing pandas exists.
     """
     if verbose:
-        print("[records] loading tables ...")
+        print(f"[records] loading tables from {data_dir}/ ...")
 
-    patients = pd.read_csv("patients.csv")
-    conditions = _as_str(pd.read_csv("conditions.csv"), "CODE")
-    medications = _as_str(pd.read_csv("medications.csv"), "CODE")
+    def read(name, usecols=None):
+        """Read, then apply the column map. usecols is applied AFTER renaming so
+        a foreign schema does not fail on names it has never heard of."""
+        frame = pd.read_csv(os.path.join(data_dir, name))
+        if column_map:
+            frame = frame.rename(columns=column_map)
+        if usecols:
+            missing = [c for c in usecols if c not in frame.columns]
+            if missing:
+                raise KeyError(
+                    f"{name} is missing {missing} — its columns are "
+                    f"{list(frame.columns)[:8]}... Supply column_map= to map a "
+                    f"foreign schema onto the canonical names.")
+            frame = frame[usecols]
+        return frame
+
+    patients = read("patients.csv")
+    conditions = _as_str(read("conditions.csv"), "CODE")
+    medications = _as_str(read("medications.csv"), "CODE")
     observations = _as_str(
-        pd.read_csv(
-            "observations.csv",
-            usecols=["DATE", "PATIENT", "CODE", "DESCRIPTION", "VALUE", "UNITS", "TYPE"],
-        ),
-        "CODE",
-    )
-    encounters = pd.read_csv(
-        "encounters.csv",
-        usecols=["START", "PATIENT", "ENCOUNTERCLASS", "CODE", "DESCRIPTION"],
-    )
-    encounters = _as_str(encounters, "CODE")
-    careplans = _as_str(pd.read_csv("careplans.csv"), "CODE")
+        read("observations.csv",
+             usecols=["DATE", "PATIENT", "CODE", "DESCRIPTION", "VALUE", "UNITS", "TYPE"]),
+        "CODE")
+    encounters = _as_str(
+        read("encounters.csv",
+             usecols=["START", "PATIENT", "ENCOUNTERCLASS", "CODE", "DESCRIPTION"]),
+        "CODE")
+    # Not every site exports every domain. An absent table is a fact about the
+    # extract, not an error — it degrades the chart, it does not stop the run.
+    careplans_path = os.path.join(data_dir, "careplans.csv")
+    if os.path.exists(careplans_path):
+        careplans = _as_str(read("careplans.csv"), "CODE")
+    else:
+        careplans = pd.DataFrame(columns=["PATIENT", "CODE", "DESCRIPTION",
+                                          "START", "STOP", "REASONDESCRIPTION"])
+        if verbose:
+            print(f"[records]   careplans.csv ABSENT in {data_dir}/ — "
+                  f"care plans will be empty for every patient")
 
     # --- drop unusable observation values, loudly -----------------------------
     # Silence here would be the wrong choice: if a future export encodes
@@ -398,6 +438,80 @@ def render_chart_minimal(record, dx_codes, a1c_codes, glucose_codes, med_codes):
         f"Highest glucose ever recorded: "
         f"{f'{glu} mg/dL' if glu is not None else 'never measured'}",
         f"Diabetes medication on file: {'yes' if has_med else 'no'}",
+    ])
+
+
+# --- Portability chart -----------------------------------------------------
+# Renders from DESCRIPTION TEXT rather than from code lists, and prints the
+# code alongside so the reader can see it. That combination is what makes the
+# portability test meaningful: run against the mangled extract the codes are
+# meaningless local integers, but the clinical text is unchanged, so a method
+# that reads text still has everything it needs while a method that matches
+# identifiers has nothing.
+
+DIABETES_TERMS = ("diabet", "hyperglyc", "prediabet")
+DM_DRUG_TERMS = ("metformin", "insulin", "liraglutide", "canagliflozin",
+                 "humulin", "humalog", "glipizide", "glyburide", "empagliflozin")
+A1C_TERMS = ("hemoglobin a1c", "hba1c")
+GLUCOSE_TERMS = ("glucose",)
+
+
+def _matches(text, terms):
+    low = str(text).lower()
+    return any(t in low for t in terms)
+
+
+def _peak_by_description(record, terms):
+    vals = []
+    for lab in record["labs"]:
+        if _matches(lab["DESCRIPTION"], terms):
+            try:
+                vals.append(float(lab["VALUE"]))
+            except (TypeError, ValueError):
+                continue
+    return max(vals) if vals else None
+
+
+def render_chart_portable(record):
+    """Six facts, derived from description text, with codes shown as-is.
+
+    Deliberately the same six facts as the minimal chart so the ablation and
+    the portability run are comparable — the only difference is that this one
+    finds them by reading rather than by matching identifiers.
+    """
+    d = record["demographics"]
+    dx = [c for c in record["conditions"] if _matches(c["DESCRIPTION"], DIABETES_TERMS)]
+    meds = [m for m in record["medications"] if _matches(m["DESCRIPTION"], DM_DRUG_TERMS)]
+    a1c = _peak_by_description(record, A1C_TERMS)
+    glu = _peak_by_description(record, GLUCOSE_TERMS)
+
+    seen_dx, dx_lines = set(), []
+    for c in sorted(dx, key=lambda c: c["START"]):
+        key = c["DESCRIPTION"]
+        if key in seen_dx:
+            continue
+        seen_dx.add(key)
+        dx_lines.append(f"  [{c['CODE']}] {c['DESCRIPTION']} (onset {c['START'][:10]})")
+
+    seen_med, med_lines = set(), []
+    for m in sorted(meds, key=lambda m: m["START"]):
+        key = m["DESCRIPTION"]
+        if key in seen_med:
+            continue
+        seen_med.add(key)
+        med_lines.append(f"  [{m['CODE']}] {m['DESCRIPTION']}")
+
+    return "\n".join([
+        f"Age: {d['age_at_reference']}",
+        f"Sex: {d['gender']}",
+        "Diabetes-related diagnoses on file:",
+        *(dx_lines or ["  (none)"]),
+        f"Highest HbA1c ever recorded: "
+        f"{f'{a1c}%' if a1c is not None else 'never measured'}",
+        f"Highest glucose ever recorded: "
+        f"{f'{glu} mg/dL' if glu is not None else 'never measured'}",
+        "Diabetes-related medications on file:",
+        *(med_lines or ["  (none)"]),
     ])
 
 
